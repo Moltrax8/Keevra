@@ -1,0 +1,49 @@
+# Frontend dependencies and build output
+/node_modules/
+/dist/
+/coverage/
+*.tsbuildinfo
+npm-debug.log*
+*.log
+*.tmp
+
+# Rust build output and Tauri-generated schemas
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# Maintainer tool build output (never shipped)
+/tools/*/target/
+
+# Local reference exports that should never be versioned
+*.docx
+*.zip
+
+# Local certificates and secrets
+*.pfx
+*.p12
+*.pvk
+*.key
+*.pem
+.env
+.env.*
+
+# Release artifacts belong in GitHub Releases, not in git
+updates.json
+updates.json.minisig
+*.sha256
+
+# Editor and OS noise
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
+Thumbs.db
+.DS_Store
+
+# Vault data must never be committed: encrypted vaults, backups, the
+# registry mapping display names to files, and attachment blob stores.
+*.vault
+*.vault.bak
+vaults.json
+*.attachments/
