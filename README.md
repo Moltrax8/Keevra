@@ -96,7 +96,7 @@ SHA-256 against `SHA256SUMS.txt` on the release page, then run it.
 
 Windows SmartScreen will warn that the publisher is unknown because the
 installer is unsigned. Choose **More info → Run anyway** only if the checksum
-matches. The build is reproducible from the tagged source; see
+matches. The installer can be rebuilt from the tagged source; see
 [`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md) for the provenance and
 verification details.
 
