@@ -17,6 +17,11 @@ use zeroize::Zeroizing;
 /// flush a draft just before its normal auto-lock (K-14).
 const SESSION_IDLE_LIMIT: Duration = Duration::from_secs(15 * 60);
 
+/// How often the backend watchdog checks the session clock. This runs on its
+/// own thread so the key is dropped even when a suspended/throttled renderer
+/// never sends another IPC call (K-08).
+const SESSION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Unlocked session. The master key exists only here, zeroized on lock.
 struct VaultSession {
     key: Zeroizing<[u8; 32]>,
@@ -53,15 +58,24 @@ fn idle_expired(last_touch: Instant) -> bool {
     last_touch.elapsed() >= SESSION_IDLE_LIMIT
 }
 
+/// Drops a session that has been idle past the backstop. Returns whether it
+/// removed anything; used by commands and by the independent watchdog (K-08).
+fn expire_idle_session(session: &mut Option<VaultSession>) -> bool {
+    let expired = session
+        .as_ref()
+        .is_some_and(|current| idle_expired(current.last_touch));
+    if expired {
+        // Dropping the session zeroizes the key through `Zeroizing`.
+        *session = None;
+    }
+    expired
+}
+
 fn session_path(
     state: &State<VaultState>,
 ) -> Result<(Zeroizing<[u8; 32]>, [u8; 16], KdfCost, PathBuf), VaultError> {
     let mut guard = lock_session(state);
-    let expired = guard
-        .as_ref()
-        .is_some_and(|session| idle_expired(session.last_touch));
-    if expired {
-        *guard = None;
+    if expire_idle_session(&mut guard) {
         return Err(VaultError::Io("vault_locked".to_string()));
     }
     match guard.as_mut() {
@@ -81,12 +95,7 @@ fn session_path(
 #[tauri::command]
 fn vault_status(state: State<VaultState>) -> VaultStatus {
     let mut guard = lock_session(&state);
-    if guard
-        .as_ref()
-        .is_some_and(|session| idle_expired(session.last_touch))
-    {
-        *guard = None;
-    }
+    expire_idle_session(&mut guard);
     match guard
         .as_ref()
         .map(|session| session.path.to_string_lossy().to_string())
@@ -107,11 +116,7 @@ fn vault_status(state: State<VaultState>) -> VaultStatus {
 #[tauri::command]
 fn vault_touch(state: State<VaultState>) -> Result<(), String> {
     let mut guard = lock_session(&state);
-    let expired = guard
-        .as_ref()
-        .is_some_and(|session| idle_expired(session.last_touch));
-    if expired {
-        *guard = None;
+    if expire_idle_session(&mut guard) {
         return Err(VaultError::Io("vault_locked".to_string()).to_string());
     }
     match guard.as_mut() {
@@ -293,48 +298,64 @@ fn vault_delete_vault(
         }
     }
 
-    let mut files_deleted = false;
-    if vault_path.exists() {
-        if !registry::is_app_managed(&dir, &path) {
-            // Externally located vault: keep the file, drop the listing only.
-            registry::forget_vault(&registry_path, &path).map_err(String::from)?;
-            clear_default_if_matches(&dir, &path)?;
-            return Ok(VaultDeleteResult {
-                files_deleted: false,
-                listing_removed: true,
-            });
-        }
-        if !vault::looks_like_vault(&vault_path) {
-            return Err(VaultError::Io("not_a_vault".to_string()).to_string());
-        }
-        let mut failures: Vec<String> = Vec::new();
-        remove_if_exists(&vault_path, &mut failures);
-        // Remove every retained generation and the restore rollback copy too;
-        // "delete vault" must not leave older encrypted snapshots behind.
-        for backup in vault::backup_paths(&vault_path) {
-            remove_if_exists(&backup, &mut failures);
-        }
-        remove_if_exists(&vault::pre_restore_path_for(&vault_path), &mut failures);
-        match std::fs::remove_dir_all(attachments::attachments_dir(&vault_path)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(format!(
-                "{}: {error}",
-                attachments::attachments_dir(&vault_path).display()
-            )),
-        }
-        if !failures.is_empty() {
-            return Err(VaultError::Io(format!("delete_failed: {}", failures.join("; "))).to_string());
-        }
-        files_deleted = true;
+    // Externally located vaults are only unlisted; the app never deletes a
+    // file outside its own data directory.
+    if !registry::is_app_managed(&dir, &path) {
+        registry::forget_vault(&registry_path, &path).map_err(String::from)?;
+        clear_default_if_matches(&dir, &path)?;
+        return Ok(VaultDeleteResult {
+            files_deleted: false,
+            listing_removed: true,
+        });
+    }
+
+    // An existing file must still look like a vault before it is destroyed.
+    // A missing live file is fine: an earlier attempt may already have removed
+    // it and failed on a backup or blob, and the retry must finish the job.
+    if vault_path.exists() && !vault::looks_like_vault(&vault_path) {
+        return Err(VaultError::Io("not_a_vault".to_string()).to_string());
+    }
+
+    // Idempotent cleanup: attempt every target even when the live file is
+    // already gone. The registry listing is dropped only after nothing remains,
+    // so the user can retry instead of being told "deleted" with ciphertext
+    // still on disk (K-01).
+    if let Err(error) = remove_managed_vault_files(&vault_path) {
+        return Err(VaultError::Io(error).to_string());
     }
 
     registry::forget_vault(&registry_path, &path).map_err(String::from)?;
     clear_default_if_matches(&dir, &path)?;
     Ok(VaultDeleteResult {
-        files_deleted,
+        files_deleted: true,
         listing_removed: true,
     })
+}
+
+/// Removes every on-disk artifact of an app-managed vault: the live file, all
+/// retained backup generations, the pre-restore rollback copy and the blob
+/// directory. Missing targets are success, so a retry after a partial failure
+/// continues instead of stopping at the first absent file (K-01).
+fn remove_managed_vault_files(vault_path: &std::path::Path) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+    remove_if_exists(vault_path, &mut failures);
+    // Every retained generation and the restore rollback copy: "delete vault"
+    // must not leave older encrypted snapshots behind.
+    for backup in vault::backup_paths(vault_path) {
+        remove_if_exists(&backup, &mut failures);
+    }
+    remove_if_exists(&vault::pre_restore_path_for(vault_path), &mut failures);
+    let blob_dir = attachments::attachments_dir(vault_path);
+    match std::fs::remove_dir_all(&blob_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!("{}: {error}", blob_dir.display())),
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("delete_failed: {}", failures.join("; ")))
+    }
 }
 
 fn remove_if_exists(path: &std::path::Path, failures: &mut Vec<String>) {
@@ -390,17 +411,30 @@ fn vault_save(
     // Best-effort orphan sweep: keep blobs referenced by the new document,
     // the verified backup (restore must never miss blobs), plus any the UI
     // retains for undo/redo history. Sweep failures never fail the save.
-    // Backup + current file are decrypted with the session key; failures
-    // yield empty lists (retain, don't delete).
+    //
+    // If a backup exists but cannot be opened with the session key, the sweep
+    // is skipped entirely: deleting now could remove a blob that only that
+    // backup references, so the safe direction is to keep every blob (K-04).
     let mut live = attachments::live_attachment_ids(&graph.0);
+    let mut preserved_verified = true;
     for preserved in vault::backup_paths(&path)
         .into_iter()
         .chain(std::iter::once(vault::pre_restore_path_for(&path)))
     {
-        live.extend(vault::attachment_ids_in_encrypted_file(&preserved, &key));
+        match vault::attachment_ids_in_encrypted_file(&preserved, &key) {
+            Ok(Some(ids)) => live.extend(ids),
+            // The file does not exist: nothing to preserve from it.
+            Ok(None) => {}
+            Err(_) => {
+                preserved_verified = false;
+                break;
+            }
+        }
     }
-    live.extend(retain_attachment_ids);
-    let _ = attachments::attachment_sweep(&path, &live);
+    if preserved_verified {
+        live.extend(retain_attachment_ids);
+        let _ = attachments::attachment_sweep(&path, &live);
+    }
     Ok(())
 }
 
@@ -547,6 +581,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(VaultState(Mutex::new(None)))
+        // Independent backend watchdog: the renderer's 5-minute timer is the
+        // friendly path, but a suspended or compromised renderer must not keep
+        // the master key alive past the 15-minute backstop (K-08).
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(SESSION_WATCHDOG_INTERVAL);
+                if let Some(state) = handle.try_state::<VaultState>() {
+                    let mut guard = lock_session(&state);
+                    expire_idle_session(&mut guard);
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             vault_status,
             vault_touch,
@@ -579,6 +627,16 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn unique_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "keevra-lib-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
+
     #[test]
     fn idle_backstop_expires_stale_sessions_only() {
         assert!(!idle_expired(Instant::now()));
@@ -588,5 +646,62 @@ mod tests {
         // The backend backstop must outlast the renderer's own auto-lock so a
         // pending draft still has time to flush through the normal path.
         assert!(SESSION_IDLE_LIMIT > Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn watchdog_drops_idle_session_and_keeps_fresh_one() {
+        let session = |last_touch| VaultSession {
+            key: Zeroizing::new([7u8; 32]),
+            salt: [0u8; 16],
+            kdf: KdfCost::default(),
+            path: PathBuf::from("test.vault"),
+            last_touch,
+        };
+
+        let mut fresh = Some(session(Instant::now()));
+        assert!(!expire_idle_session(&mut fresh));
+        assert!(fresh.is_some());
+
+        let mut stale = Some(session(
+            Instant::now() - SESSION_IDLE_LIMIT - Duration::from_secs(1),
+        ));
+        assert!(expire_idle_session(&mut stale));
+        assert!(stale.is_none());
+
+        let mut empty: Option<VaultSession> = None;
+        assert!(!expire_idle_session(&mut empty));
+    }
+
+    /// K-01: a delete that already removed the live file (and failed on a
+    /// backup or blob) must finish the remaining targets on retry instead of
+    /// reporting success with ciphertext still on disk.
+    #[test]
+    fn managed_delete_removes_leftovers_after_partial_failure() {
+        let dir = unique_dir("delete");
+        let vault_path = dir.join("v.vault");
+        std::fs::write(&vault_path, b"live").expect("live");
+        for backup in vault::backup_paths(&vault_path) {
+            std::fs::write(&backup, b"backup").expect("backup");
+        }
+        std::fs::write(vault::pre_restore_path_for(&vault_path), b"rollback")
+            .expect("pre-restore");
+        let blob_dir = attachments::attachments_dir(&vault_path);
+        std::fs::create_dir_all(&blob_dir).expect("blob dir");
+        std::fs::write(blob_dir.join("a.bin"), b"blob").expect("blob");
+
+        // Simulate the partial earlier attempt: the live file is already gone.
+        std::fs::remove_file(&vault_path).expect("remove live");
+
+        remove_managed_vault_files(&vault_path).expect("first cleanup");
+        assert!(!vault_path.exists());
+        for backup in vault::backup_paths(&vault_path) {
+            assert!(!backup.exists(), "backup left behind: {}", backup.display());
+        }
+        assert!(!vault::pre_restore_path_for(&vault_path).exists());
+        assert!(!blob_dir.exists());
+
+        // A user retry must be idempotent, not an error.
+        remove_managed_vault_files(&vault_path).expect("second cleanup");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

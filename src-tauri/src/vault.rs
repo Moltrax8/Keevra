@@ -33,11 +33,15 @@ pub const MIN_PASSWORD_CHARS: usize = 12;
 pub const KDF_MEMORY_KIB: u32 = 65536;
 pub const KDF_ITERATIONS: u32 = 3;
 pub const KDF_PARALLELISM: u32 = 1;
-// DoS bounds for stored parameters honored on open (generous ceilings: the
-// defaults above sit far below them).
-const KDF_MAX_MEMORY_KIB: u32 = 1 << 20;
-const KDF_MAX_ITERATIONS: u32 = 10;
-const KDF_MAX_PARALLELISM: u32 = 8;
+// DoS bounds for stored parameters honored on open. A hostile vault can set
+// these, so the ceiling is a real computation budget, not just a sanity check:
+// 256 MiB with 6 passes and 4 lanes is already several seconds of Argon2id on
+// a normal desktop, while the defaults (64 MiB / 3 / 1) stay far below it.
+// Older vaults above the ceiling are refused with the generic
+// wrong-password-or-corrupt error instead of freezing the unlock path (K-05).
+const KDF_MAX_MEMORY_KIB: u32 = 256 * 1024;
+const KDF_MAX_ITERATIONS: u32 = 6;
+const KDF_MAX_PARALLELISM: u32 = 4;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
@@ -666,16 +670,21 @@ pub fn pre_restore_path_for(path: &Path) -> PathBuf {
 }
 
 /// Attachment IDs referenced by an encrypted vault file on disk, decrypted
-/// with the session key. Best-effort: any failure yields an empty list so
-/// callers retain rather than delete.
-pub fn attachment_ids_in_encrypted_file(path: &Path, key: &[u8; KEY_LEN]) -> Vec<String> {
-    let Ok(envelope_json) = read_vault_file(path) else {
-        return Vec::new();
-    };
-    match open_envelope_with_key(&envelope_json, key) {
-        Ok(graph) => crate::attachments::live_attachment_ids(&graph.0),
-        Err(_) => Vec::new(),
+/// with the session key.
+///
+/// `Ok(None)` means the file does not exist. An existing file that cannot be
+/// read, decrypted or parsed is an error: callers must fail closed and keep
+/// every blob rather than assume the backup is empty (K-04).
+pub fn attachment_ids_in_encrypted_file(
+    path: &Path,
+    key: &[u8; KEY_LEN],
+) -> Result<Option<Vec<String>>, VaultError> {
+    if !path.exists() {
+        return Ok(None);
     }
+    let envelope_json = read_vault_file(path)?;
+    let graph = open_envelope_with_key(&envelope_json, key)?;
+    Ok(Some(crate::attachments::live_attachment_ids(&graph.0)))
 }
 
 #[cfg(test)]
@@ -1130,5 +1139,112 @@ mod tests {
             let _ = fs::remove_file(generation);
         }
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attachment_ids_from_backup_distinguish_missing_and_corrupt() {
+        let path = unique_path("attachment-ids");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+        let (_, salt, key, cost) = create_vault(&path, b"correct horse battery").expect("create");
+        let graph = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [],
+            "presets": [],
+            "attachments": [{
+                "id": "att-1",
+                "nodeId": "a",
+                "fileName": "x.txt",
+                "mimeType": "text/plain",
+                "sizeBytes": 1,
+                "sha256Hex": "00",
+                "createdAtMs": 0,
+            }],
+        }));
+        save_vault(&path, &graph, &key, &salt, cost).expect("save");
+
+        // A readable file returns its live IDs (K-04).
+        assert_eq!(
+            attachment_ids_in_encrypted_file(&path, &key).expect("readable"),
+            Some(vec!["att-1".to_string()])
+        );
+
+        // Absent backups are fine: nothing to preserve.
+        let missing = path.with_extension("missing.vault");
+        assert_eq!(
+            attachment_ids_in_encrypted_file(&missing, &key).expect("missing is ok"),
+            None
+        );
+
+        // Existing but corrupt/foreign files must be an error, never an empty
+        // list, so the caller can fail closed (K-04).
+        let corrupt = path.with_extension("corrupt.vault");
+        fs::write(&corrupt, b"not a vault").expect("corrupt fixture");
+        assert!(attachment_ids_in_encrypted_file(&corrupt, &key).is_err());
+
+        let other = path.with_extension("other.vault");
+        let _ = fs::remove_file(&other);
+        let (_, _, _, _) = create_vault(&other, b"another password").expect("other vault");
+        assert!(attachment_ids_in_encrypted_file(&other, &key).is_err());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&corrupt);
+        let _ = fs::remove_file(&other);
+        let _ = fs::remove_file(backup_path(&path));
+        let _ = fs::remove_file(backup_path(&other));
+    }
+
+    #[test]
+    fn stored_kdf_cost_above_budget_is_rejected() {
+        let salt = [1u8; SALT_LEN];
+        // The defaults must stay valid.
+        assert!(derive_key_with(
+            b"pw",
+            &salt,
+            KDF_MEMORY_KIB,
+            KDF_ITERATIONS,
+            KDF_PARALLELISM
+        )
+        .is_ok());
+        // Anything above the accepted computation budget is refused before
+        // Argon2 allocates memory (K-05).
+        assert!(derive_key_with(
+            b"pw",
+            &salt,
+            KDF_MAX_MEMORY_KIB + 1,
+            KDF_ITERATIONS,
+            KDF_PARALLELISM
+        )
+        .is_err());
+        assert!(derive_key_with(
+            b"pw",
+            &salt,
+            KDF_MEMORY_KIB,
+            KDF_MAX_ITERATIONS + 1,
+            KDF_PARALLELISM
+        )
+        .is_err());
+        assert!(derive_key_with(
+            b"pw",
+            &salt,
+            KDF_MEMORY_KIB,
+            KDF_ITERATIONS,
+            KDF_MAX_PARALLELISM + 1
+        )
+        .is_err());
+
+        let oversized = serde_json::json!({
+            "version": VAULT_VERSION,
+            "kdf": {
+                "alg": "argon2id",
+                "m": KDF_MAX_MEMORY_KIB + 1,
+                "t": KDF_ITERATIONS,
+                "p": KDF_PARALLELISM,
+                "salt_b64": B64.encode([0u8; SALT_LEN]),
+            },
+            "nonce_b64": B64.encode([0u8; NONCE_LEN]),
+            "ciphertext_b64": B64.encode([1u8; 32]),
+        });
+        assert!(validate_envelope_value(&oversized).is_err());
     }
 }

@@ -36,6 +36,8 @@ export interface VaultSessionOptions {
   persist: () => Promise<boolean>;
   /** Commits any focused editor drafts, then lets React apply them. */
   flushDrafts: () => Promise<DraftFlushResult>;
+  /** Waits for in-flight attachment imports before a save or vault switch. */
+  waitForPendingAttachments: () => Promise<void>;
   applyVaultDocument: (stored: VaultGraph) => void;
   onLocked: () => void;
 }
@@ -80,6 +82,7 @@ export function useVaultSession({
   dirty,
   persist,
   flushDrafts,
+  waitForPendingAttachments,
   applyVaultDocument,
   onLocked,
 }: VaultSessionOptions): VaultSessionApi {
@@ -152,6 +155,10 @@ export function useVaultSession({
    * an in-progress field edit can never be dropped by a state clear.
    */
   async function ensureSaved(): Promise<boolean> {
+    // An import may still be writing a blob and has not committed its metadata
+    // yet. Finish it first so lock/close/switch cannot clear the document
+    // underneath it (K-03).
+    await waitForPendingAttachments();
     const { changed, failed } = await flushDrafts();
     if (failed) return false;
     if (!dirty && !changed) return true;

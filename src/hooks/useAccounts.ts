@@ -64,6 +64,7 @@ export interface AccountsApi {
   confirmingAttId: AttachmentId | null;
   pickerBusy: boolean;
   uploadAttachment: () => Promise<void>;
+  pendingAttachments: () => Promise<void>;
   downloadAttachment: (meta: AttachmentMeta) => Promise<void>;
   deleteAttachment: (meta: AttachmentMeta) => void;
 }
@@ -72,6 +73,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
   const [accounts, setAccounts] = useState<Account[]>(() => demoAccounts());
   const [presets, setPresets] = useState<AccountPreset[]>([]);
   const [attachments, setAttachments] = useState<AttachmentMeta[]>([]);
+  const [documentEpoch, setDocumentEpoch] = useState(0);
   const [serviceIcons, setServiceIcons] = useState<Record<string, string>>({});
   const [extraKeys, setExtraKeys] = useState<Record<string, unknown>>({});
   const [migrationWarnings, setMigrationWarnings] = useState<string[]>([]);
@@ -174,7 +176,12 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     return null;
   }
 
-  const attachmentUi = useAttachments({ selectedAccount, setAttachments, commit });
+  const attachmentUi = useAttachments({
+    selectedAccount,
+    documentEpoch,
+    setAttachments,
+    commit,
+  });
 
   function applyVaultDocument(stored: VaultGraph): string[] {
     const { graph, warnings } = migrateVaultGraphReport(stored);
@@ -187,6 +194,8 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     setSelectedAccountId(null);
     setQuery("");
     setAddError(null);
+    // Invalidate results of imports that started against the old document.
+    setDocumentEpoch((current) => current + 1);
     attachmentUi.resetUi();
     revisionRef.current = 0;
     setRevision(0);
@@ -209,6 +218,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     setSelectedAccountId(null);
     setQuery("");
     setAddError(null);
+    setDocumentEpoch((current) => current + 1);
     attachmentUi.resetUi();
     revisionRef.current = 0;
     setRevision(0);
@@ -298,6 +308,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     confirmingAttId: attachmentUi.confirmingAttId,
     pickerBusy: attachmentUi.pickerBusy,
     uploadAttachment: attachmentUi.uploadAttachment,
+    pendingAttachments: attachmentUi.waitForPending,
     downloadAttachment: attachmentUi.downloadAttachment,
     deleteAttachment: attachmentUi.deleteAttachment,
   };

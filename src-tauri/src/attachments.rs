@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
@@ -32,7 +33,10 @@ static ATTACHMENT_IO_LOCK: Mutex<()> = Mutex::new(());
 
 /// Imports that returned to the frontend but whose metadata has not reached
 /// the vault document yet. The sweep must retain these until a save lists them.
-static PENDING_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Keyed by vault path: two vaults may legitimately use the same attachment ID
+/// without one vault's pending import protecting the other's blob (K-09).
+static PENDING_IDS: std::sync::LazyLock<Mutex<HashMap<PathBuf, HashSet<String>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn lock_attachments() -> MutexGuard<'static, ()> {
     ATTACHMENT_IO_LOCK
@@ -40,27 +44,40 @@ pub(crate) fn lock_attachments() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn mark_pending(id: &str) {
+fn pending_key(vault_path: &Path) -> PathBuf {
+    vault_path.to_path_buf()
+}
+
+fn mark_pending(vault_path: &Path, id: &str) {
     let mut pending = PENDING_IDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !pending.iter().any(|existing| existing == id) {
-        pending.push(id.to_string());
+    pending
+        .entry(pending_key(vault_path))
+        .or_default()
+        .insert(id.to_string());
+}
+
+fn clear_pending(vault_path: &Path, id: &str) {
+    let mut pending = PENDING_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = pending_key(vault_path);
+    if let Some(ids) = pending.get_mut(&key) {
+        ids.remove(id);
+        if ids.is_empty() {
+            pending.remove(&key);
+        }
     }
 }
 
-fn clear_pending(id: &str) {
-    let mut pending = PENDING_IDS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    pending.retain(|existing| existing != id);
-}
-
-fn pending_ids() -> Vec<String> {
+fn pending_ids(vault_path: &Path) -> HashSet<String> {
     PENDING_IDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+        .get(&pending_key(vault_path))
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +191,7 @@ pub fn attachment_import(
     let _guard = lock_attachments();
     // Publish the ID before the blob becomes visible so a concurrent sweep
     // retains it even if the frontend has not committed metadata yet.
-    mark_pending(attachment_id);
+    mark_pending(vault_path, attachment_id);
     let result = (|| -> Result<AttachmentMeta, VaultError> {
         let bytes = read_limited(source_path, MAX_ATTACHMENT_BYTES, "attachment_too_large")?;
         let file_name = source_path
@@ -208,7 +225,7 @@ pub fn attachment_import(
         })
     })();
     if result.is_err() {
-        clear_pending(attachment_id);
+        clear_pending(vault_path, attachment_id);
     }
     result
 }
@@ -371,13 +388,21 @@ pub fn verify_attachment(
 pub fn attachment_sweep(vault_path: &Path, live_ids: &[String]) -> usize {
     let _guard = lock_attachments();
     {
+        let key = pending_key(vault_path);
         let mut pending = PENDING_IDS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A live ID is committed metadata, so it is no longer pending.
-        pending.retain(|id| !live_ids.iter().any(|live| live == id));
+        if let Some(ids) = pending.get_mut(&key) {
+            // A live ID is committed metadata, so it is no longer pending.
+            for live in live_ids {
+                ids.remove(live);
+            }
+            if ids.is_empty() {
+                pending.remove(&key);
+            }
+        }
     }
-    let pending = pending_ids();
+    let pending = pending_ids(vault_path);
     let dir = attachments_dir(vault_path);
     let entries = fs::read_dir(&dir).map(|read| {
         read.filter_map(|entry| entry.ok()).collect::<Vec<_>>()
@@ -391,7 +416,7 @@ pub fn attachment_sweep(vault_path: &Path, live_ids: &[String]) -> usize {
             }
             let id = name.trim_end_matches(".bin");
             if !live_ids.iter().any(|live| live == id)
-                && !pending.iter().any(|held| held == id)
+                && !pending.contains(id)
                 && fs::remove_file(entry.path()).is_ok()
             {
                 removed += 1;
@@ -522,5 +547,39 @@ mod tests {
         assert!(blob_path(&vault, "keep-1").exists());
         assert!(!blob_path(&vault, "drop-1").exists());
         let _ = fs::remove_dir_all(vault.parent().expect("parent"));
+    }
+
+    #[test]
+    fn pending_imports_are_isolated_per_vault() {
+        // Two vaults may legitimately use the same attachment ID. Pending state
+        // from one must never protect (or clear) the other vault's blob (K-09).
+        let vault_a = sandbox();
+        let vault_b = vault_a.with_file_name("vault-b.vault");
+        let source = vault_a.with_extension("source.bin");
+        fs::write(&source, b"same-id-bytes").expect("fixture");
+
+        attachment_import(&key(), &vault_a, "same-id", "node-1", &source).expect("import a");
+        attachment_import(&key(), &vault_b, "same-id", "node-1", &source).expect("import b");
+
+        // Both imports are pending for their own vault, so neither sweep may
+        // delete the other vault's blob.
+        assert_eq!(attachment_sweep(&vault_a, &[]), 0);
+        assert_eq!(attachment_sweep(&vault_b, &[]), 0);
+        assert!(blob_path(&vault_a, "same-id").exists());
+        assert!(blob_path(&vault_b, "same-id").exists());
+
+        // Committing A's metadata clears only A's pending entry.
+        assert_eq!(attachment_sweep(&vault_a, &["same-id".to_string()]), 0);
+        assert_eq!(attachment_sweep(&vault_a, &[]), 1);
+        assert!(!blob_path(&vault_a, "same-id").exists());
+        assert!(blob_path(&vault_b, "same-id").exists());
+        assert_eq!(attachment_sweep(&vault_b, &[]), 0);
+
+        // Committing B later releases its own blob to the orphan sweep.
+        assert_eq!(attachment_sweep(&vault_b, &["same-id".to_string()]), 0);
+        assert_eq!(attachment_sweep(&vault_b, &[]), 1);
+        assert!(!blob_path(&vault_b, "same-id").exists());
+
+        let _ = fs::remove_dir_all(vault_a.parent().expect("parent"));
     }
 }

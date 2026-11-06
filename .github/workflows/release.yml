@@ -30,16 +30,16 @@ jobs:
       attestations: write  # Sigstore-backed attestations
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: "24"
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Check tag matches every version file
         shell: pwsh
@@ -63,7 +63,7 @@ jobs:
       # Audit the exact locked graph of the tagged commit. CI runs this on
       # main, but a tag can point at an unmerged commit, so the gate is
       # repeated here rather than inherited.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
         with:
           tool: cargo-audit
 
@@ -149,7 +149,7 @@ jobs:
         run: npm sbom --sbom-format=cyclonedx > release-artifacts/keevra-npm-sbom.cdx.json
 
       - name: Rust SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: src-tauri
           format: cyclonedx-json
@@ -158,17 +158,17 @@ jobs:
           upload-release-assets: false
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: release-artifacts/*
 
       - name: Attest SBOM
-        uses: actions/attest@v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: release-artifacts/*
           sbom-path: release-artifacts/keevra-rust-sbom.cdx.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: keevra-release-${{ github.ref_name }}
           path: release-artifacts/*

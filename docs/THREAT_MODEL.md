@@ -21,10 +21,13 @@ In scope:
   boundary; the vault directory is created with user-only access where the
   platform supports it.
 - **Casual observation / accidental exposure.** Masked secret display with
-  explicit reveal, no secrets in logs/panic messages/crash output, generic
-  unlock-failure errors. TOTP codes assume a correct device clock; copied
-  secrets are cleared from the OS clipboard after 30 seconds and on lock, but
-  only when the clipboard still contains the value Keevra copied.
+  explicit reveal; generated TOTP codes are masked too and an explicit reveal
+  expires after 15 seconds or when the window loses focus/tab visibility, so a
+  valid 2FA code is not left on screen during sharing or when looking away.
+  No secrets in logs/panic messages/crash output, generic unlock-failure
+  errors. TOTP codes assume a correct device clock; copied secrets are cleared
+  from the OS clipboard after 30 seconds and on lock, but only when the
+  clipboard still contains the value Keevra copied.
 - **Interrupted writes and corruption.** Atomic save + verified backup + manual
   restore path; never silently roll back.
 
@@ -44,8 +47,11 @@ Out of scope (documented, not ignored):
 - **KDF:** Argon2id (`argon2` crate), m = 65536 KiB, t = 3, p = 1, 32-byte
   output, fresh 16-byte random salt per vault, parameters stored in the file
   header (versioned for future tuning). Stored parameters are honored on open
-  within generous DoS bounds, so older vaults keep opening at their original
-  cost while new vaults use current defaults. In-app unlock throttling
+  within a bounded computation budget — 256 MiB memory, 6 passes, 4 lanes —
+  so older vaults keep opening at their original cost while a hostile header
+  cannot freeze the unlock path or force a multi-gigabyte allocation. A vault
+  above the budget is refused with the same generic corruption error rather
+  than being opened at attacker-chosen cost. In-app unlock throttling
   (progressive 1–5 s delays) only slows manual guessing on the device — it
   cannot slow offline guessing of a stolen file, which is exactly what the
   KDF parameters defend against. New vault passwords require ≥12 characters.
@@ -72,6 +78,20 @@ Out of scope (documented, not ignored):
   directory → flushes → renames over the vault. The previous good vault is
   copied to `vault.bak` before replacement; restore is explicit
   (`vault_restore_backup`), never automatic.
+- **Deletion is idempotent and complete.** `vault_delete_vault` removes the
+  live file, every retained backup generation, the pre-restore rollback copy
+  and the blob directory for an app-managed vault even when an earlier attempt
+  already removed the live file. Every target is attempted; if anything
+  remains the registry listing is kept and the error names the leftovers, so
+  the user can retry instead of being told "deleted" while ciphertext stays on
+  disk. Vaults outside the app's data directory are only unlisted, never
+  deleted.
+- **Attachment sweep fails closed.** Blob cleanup preserves every ID reachable
+  from the live document, the verified backup, the pre-restore copy and the
+  renderer's undo history. If an existing backup cannot be read or decrypted,
+  the sweep is skipped entirely rather than treating it as empty; pending
+  imports are tracked per vault path so one vault's sweep cannot clear another
+  vault's in-flight blob.
 - **Unlock failures** return a generic error, plus a progressive 1–5 s UI
   calm-down between manual attempts. The calm-down cannot slow offline
   guessing of a stolen file, so the KDF parameters — not throttling —
@@ -88,7 +108,10 @@ Out of scope (documented, not ignored):
   the document as an opaque JSON map and only re-validates non-empty unique
   IDs in present collections.
 - **Session:** locked by default. Unlock is per-launch; frontend auto-locks
-  after 5 minutes without input and clears account state from memory.
+  after 5 minutes without input and clears account state from memory. Rust
+  additionally runs an independent 5-second watchdog that drops the key at a
+  15-minute idle backstop, so a suspended or compromised renderer cannot keep
+  the master key alive past the policy by simply not sending IPC calls.
 - **Logging:** passwords, keys, and plaintext never enter logs, panic strings,
   or error payloads. Errors to the UI are coarse (`wrong_password_or_corrupt`
   deliberately does not distinguish).
@@ -96,6 +119,10 @@ Out of scope (documented, not ignored):
   verifies a signed manifest before offering a download. It never installs
   silently and never downloads without explicit user action. Packaging is
   enabled for local test builds. Builds are unsigned by default.
+  Update downloads use a custom redirect policy: every hop, not just the first
+  URL, must stay on the HTTPS GitHub allow-list, and chains are capped at 10
+  hops. Release and CI workflows pin every third-party action to a full
+  40-character commit SHA so a moved tag cannot change privileged build steps.
 
 ## Exit criteria (all required before real secrets)
 

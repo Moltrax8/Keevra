@@ -14,6 +14,9 @@ import { consumeRecoveryCode, maskRecoveryCode, parseRecoveryCodes } from "../re
 import { CLIPBOARD_CLEAR_MS, copySecretWithAutoClear } from "../clipboard";
 import { describeDomainError, isSecretField } from "../display";
 
+/** How long an explicitly revealed TOTP code stays visible (K-07). */
+const TOTP_REVEAL_MS = 15_000;
+
 export function FieldRow({
   accountId,
   field,
@@ -33,6 +36,7 @@ export function FieldRow({
   const [error, setError] = useState<string | null>(null);
   const [totpCode, setTotpCode] = useState<string | null>(null);
   const [totpRemaining, setTotpRemaining] = useState<number | null>(null);
+  const [totpRevealed, setTotpRevealed] = useState(false);
   const [copyNotice, setCopyNotice] = useState<string | null>(null);
   const [newCode, setNewCode] = useState("");
   const [codesRevealed, setCodesRevealed] = useState(false);
@@ -79,6 +83,7 @@ export function FieldRow({
   useEffect(() => {
     if (field.type !== "TOTP" || field.value.trim() === "") {
       setTotpCode(null);
+      setTotpRevealed(false);
       return;
     }
     let cancelled = false;
@@ -100,6 +105,22 @@ export function FieldRow({
       clearInterval(timer);
     };
   }, [field.type, field.value]);
+
+  // The code is masked by default (K-07). An explicit reveal lasts only a few
+  // seconds and ends early when the window loses focus, so screen sharing or
+  // looking away does not leave a valid 2FA code on display.
+  useEffect(() => {
+    if (!totpRevealed) return;
+    const hide = () => setTotpRevealed(false);
+    const timer = setTimeout(hide, TOTP_REVEAL_MS);
+    window.addEventListener("blur", hide);
+    document.addEventListener("visibilitychange", hide);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("blur", hide);
+      document.removeEventListener("visibilitychange", hide);
+    };
+  }, [totpRevealed]);
 
   function save(): boolean {
     if (label === saved.current.label && value === saved.current.value) return false;
@@ -304,10 +325,21 @@ export function FieldRow({
         <div className="totp-box" aria-live="polite">
           {totpCode !== null ? (
             <>
-              <div className="totp-box__code">{totpCode}</div>
+              <div className="totp-box__code" aria-label={totpRevealed ? "TOTP code" : "TOTP code hidden"}>
+                {totpRevealed ? totpCode : "••• •••"}
+              </div>
               <div className="totp-box__meta">
                 <Clock />
                 <span>{totpRemaining ?? 30}s left</span>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => setTotpRevealed((current) => !current)}
+                  aria-label={totpRevealed ? "Hide TOTP code" : "Show TOTP code"}
+                >
+                  {totpRevealed ? <EyeOff /> : <Eye />}
+                  {totpRevealed ? "Hide code" : "Show code"}
+                </button>
                 <button type="button" className="mini-btn" onClick={() => void copyText(totpCode)}>
                   <Copy /> Copy code
                 </button>

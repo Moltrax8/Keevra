@@ -1,7 +1,7 @@
 {
   "name": "keevra",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A local-first, encrypted account directory for Windows.",
   "license": "MIT",
   "author": "MOHAMMADAMIN TOGHIPOUR",
@@ -30,9 +30,11 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^6.0.2",
+    "jsdom": "^27.4.0",
     "typescript": "~6.0.3",
     "vite": "^8.0.16",
     "vitest": "^5.0.0"

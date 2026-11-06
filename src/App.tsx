@@ -93,6 +93,7 @@ function App() {
     dirty: accounts.dirty,
     persist: doPersist,
     flushDrafts,
+    waitForPendingAttachments: accounts.pendingAttachments,
     applyVaultDocument,
     onLocked,
   });
@@ -141,13 +142,27 @@ function App() {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const appWindow = getCurrentWindow();
         const stop = await appWindow.onCloseRequested(async (event) => {
-          if (!vaultActiveRef.current) return;
           event.preventDefault();
+          // Only an unlocked vault needs the save-then-lock gate. Locked,
+          // demo and boot states close immediately; this must be explicit
+          // because the close request has already been prevented.
+          if (!vaultActiveRef.current) {
+            try {
+              await appWindow.destroy();
+            } catch (error) {
+              // Permission or WebView failure: leave the window usable and
+              // let the user try again instead of silently doing nothing.
+              console.error("Keevra: window close failed", error);
+            }
+            return;
+          }
           if (closingRef.current) return;
           closingRef.current = true;
           try {
             // handleVaultClose flushes drafts and persists before locking.
             if (await closeVault()) await appWindow.destroy();
+          } catch (error) {
+            console.error("Keevra: close request failed", error);
           } finally {
             closingRef.current = false;
           }

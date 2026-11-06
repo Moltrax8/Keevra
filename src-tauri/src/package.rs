@@ -16,9 +16,10 @@ use crate::vault::{read_limited, write_atomic, VaultError};
 pub const PACKAGE_VERSION: u32 = 1;
 pub const PACKAGE_FORMAT: &str = "keevra-package";
 const LEGACY_PACKAGE_FORMAT: &str = "vaulttrax-package";
-/// Hard ceiling for the single-file package read (attachments are already
-/// capped individually; this keeps a hostile file from exhausting memory).
-pub const MAX_PACKAGE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Hard ceiling for the single-file package read. A package is parsed into
+/// memory, so the cap bounds peak usage; the value is deliberately far below
+/// the old 1 GiB ceiling that could stall or OOM the app (K-05).
+pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ATTACHMENTS: usize = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,9 +135,32 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
     if dest_vault_path.exists() {
         return Err(VaultError::AlreadyExists);
     }
-    let bytes = read_limited(source_path, MAX_PACKAGE_BYTES, "package_too_large")?;
-    let text = String::from_utf8(bytes).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    let package: Package = serde_json::from_str(&text).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    // Check the size from metadata first, then parse straight from a buffered
+    // file reader: the old path kept the raw byte buffer *and* the parsed
+    // package in memory at the same time (K-05).
+    let metadata = fs::metadata(source_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            VaultError::NotFound
+        } else {
+            VaultError::Io(error.to_string())
+        }
+    })?;
+    if metadata.len() > MAX_PACKAGE_BYTES {
+        return Err(VaultError::Io("package_too_large".to_string()));
+    }
+    let file = fs::File::open(source_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            VaultError::NotFound
+        } else {
+            VaultError::Io(error.to_string())
+        }
+    })?;
+    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+    let package = Package::deserialize(&mut deserializer)
+        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    deserializer
+        .end()
+        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
     // Accept the current format and the legacy name so old exports still import.
     if (package.format != PACKAGE_FORMAT && package.format != LEGACY_PACKAGE_FORMAT)
         || package.version != PACKAGE_VERSION
@@ -415,6 +439,28 @@ mod tests {
         assert!(import_package(&partial, &partial_dest).is_err());
         assert!(!partial_dest.exists());
         assert!(!crate::attachments::attachments_dir(&partial_dest).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// K-05: the package cap is enforced from file metadata before any parse,
+    /// so an oversized file is rejected without being read into memory.
+    #[test]
+    fn oversized_package_is_rejected_before_reading() {
+        let dir = std::env::temp_dir().join(format!("keevra-pkgbig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let oversized = dir.join("oversized.json");
+        let file = fs::File::create(&oversized).expect("create");
+        file.set_len(MAX_PACKAGE_BYTES + 1).expect("sparse size");
+        drop(file);
+
+        let error = import_package(&oversized, &dir.join("dest.vault"))
+            .expect_err("oversized package must be rejected");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "package_too_large"),
+            "unexpected error: {error:?}"
+        );
+        assert!(!dir.join("dest.vault").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

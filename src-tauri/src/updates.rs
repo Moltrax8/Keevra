@@ -112,15 +112,48 @@ fn allowed_update_host(host: &str) -> bool {
         || host.ends_with(".githubusercontent.com")
 }
 
+const MAX_UPDATE_REDIRECTS: usize = 10;
+
+fn redirect_target_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(allowed_update_host)
+}
+
+/// Every hop of a redirect chain must stay on the update allow-list. Exposed
+/// for tests: the reqwest policy below is a thin wrapper around this (K-10).
+fn redirect_chain_allows(previous_hops: usize, url: &str) -> bool {
+    if previous_hops >= MAX_UPDATE_REDIRECTS {
+        return false;
+    }
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| redirect_target_allowed(&parsed))
+}
+
+fn update_http_client() -> Result<reqwest::Client, VaultError> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if !redirect_chain_allows(attempt.previous().len(), attempt.url().as_str()) {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "update redirect left the HTTPS GitHub allow-list",
+            ));
+        }
+        attempt.follow()
+    });
+    reqwest::Client::builder()
+        .redirect(policy)
+        .build()
+        .map_err(|e| VaultError::Io(format!("update_client_failed:{e}")))
+}
+
 fn validate_update_url(url: &str) -> Result<reqwest::Url, VaultError> {
     let parsed = reqwest::Url::parse(url).map_err(|_| VaultError::Io("invalid_update_url".to_string()))?;
-    if parsed.scheme() != "https" {
+    if !redirect_target_allowed(&parsed) {
         return Err(VaultError::Io("invalid_update_url".to_string()));
     }
-    match parsed.host_str() {
-        Some(host) if allowed_update_host(host) => Ok(parsed),
-        _ => Err(VaultError::Io("invalid_update_host".to_string())),
-    }
+    Ok(parsed)
 }
 
 /// Downloads `url` (GitHub hosts, HTTPS only), verifies SHA256, saves to
@@ -136,7 +169,10 @@ pub async fn download_verified(
         return Err(VaultError::Io("invalid_update_sha".to_string()));
     }
     let parsed = validate_update_url(url)?;
-    let mut response = reqwest::get(parsed)
+    let client = update_http_client()?;
+    let mut response = client
+        .get(parsed)
+        .send()
         .await
         .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
     if !response.status().is_success() {
@@ -213,6 +249,33 @@ mod tests {
         assert!(validate_update_url("https://evil.example.com/x.exe").is_err());
         assert!(validate_update_url("https://github.com/Moltrax8/Keevra/releases/download/v1/x.exe").is_ok());
         assert!(validate_update_url("https://objects.githubusercontent.com/abc").is_ok());
+    }
+
+    #[test]
+    fn every_redirect_hop_must_stay_on_the_allow_list() {
+        // Same-host and approved-CDN redirects are followed.
+        assert!(redirect_chain_allows(
+            0,
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/x.exe"
+        ));
+        assert!(redirect_chain_allows(
+            1,
+            "https://objects.githubusercontent.com/abc"
+        ));
+        assert!(redirect_chain_allows(
+            2,
+            "https://release-assets.githubusercontent.com/abc"
+        ));
+        // A redirect to another host, or to plain HTTP, is refused.
+        assert!(!redirect_chain_allows(0, "https://evil.example.com/x.exe"));
+        assert!(!redirect_chain_allows(0, "http://github.com/x.exe"));
+        assert!(!redirect_chain_allows(0, "file:///C:/x.exe"));
+        // Chains cannot grow without bound.
+        assert!(!redirect_chain_allows(MAX_UPDATE_REDIRECTS, "https://github.com/x"));
+        assert!(redirect_chain_allows(
+            MAX_UPDATE_REDIRECTS - 1,
+            "https://github.com/x"
+        ));
     }
 
     #[test]

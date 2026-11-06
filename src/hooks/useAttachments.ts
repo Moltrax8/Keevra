@@ -1,4 +1,4 @@
-import { useState, type Dispatch, type SetStateAction } from "react";
+import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import type { Account, AttachmentId, AttachmentMeta } from "../domain";
 import { attachmentExport, attachmentImport, pickExportFile, pickImportFile } from "../vaultApi";
 import { formatBytes, isAttachmentMeta } from "../attachments";
@@ -6,6 +6,8 @@ import { newAttachmentId } from "../ids";
 
 export interface AttachmentUiOptions {
   selectedAccount: Account | null;
+  /** Increments whenever the document is replaced (open/create/lock). */
+  documentEpoch: number;
   setAttachments: Dispatch<SetStateAction<AttachmentMeta[]>>;
   commit: () => void;
 }
@@ -18,6 +20,8 @@ export interface AttachmentUiApi {
   uploadAttachment: () => Promise<void>;
   downloadAttachment: (meta: AttachmentMeta) => Promise<void>;
   deleteAttachment: (meta: AttachmentMeta) => void;
+  /** Waits for imports that are already running; used before a vault switch. */
+  waitForPending: () => Promise<void>;
   /** Clears transient messages when the document changes or the vault locks. */
   resetUi: () => void;
 }
@@ -33,6 +37,7 @@ function describeAttachmentError(error: unknown): string {
 
 export function useAttachments({
   selectedAccount,
+  documentEpoch,
   setAttachments,
   commit,
 }: AttachmentUiOptions): AttachmentUiApi {
@@ -40,9 +45,25 @@ export function useAttachments({
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [confirmingAttId, setConfirmingAttId] = useState<AttachmentId | null>(null);
   const [pickerBusy, setPickerBusy] = useState(false);
+  // The epoch is mirrored in a ref so an import that finishes after a vault
+  // switch can compare against the value captured when it started (K-03).
+  const epochRef = useRef(documentEpoch);
+  epochRef.current = documentEpoch;
+  const pendingImports = useRef<Set<Promise<void>>>(new Set());
+
+  /** Lets lock/switch wait for an in-flight import instead of clearing state. */
+  async function waitForPending(): Promise<void> {
+    // A loop also covers an import that starts while this call is awaiting,
+    // though `pickerBusy` normally serialises uploads already.
+    while (pendingImports.current.size > 0) {
+      await Promise.allSettled([...pendingImports.current]);
+    }
+  }
 
   async function uploadAttachment() {
     if (selectedAccount === null || pickerBusy) return;
+    const accountId = selectedAccount.id;
+    const startEpoch = documentEpoch;
     setAttachmentError(null);
     setAttachmentNotice(null);
     setPickerBusy(true);
@@ -58,18 +79,34 @@ export function useAttachments({
       setPickerBusy(false);
       return;
     }
-    try {
-      const meta = await attachmentImport(newAttachmentId(), selectedAccount.id, sourcePath);
-      if (!isAttachmentMeta(meta)) {
-        setAttachmentError("Attachment operation failed.");
-        return;
+
+    const task = (async () => {
+      try {
+        const meta = await attachmentImport(newAttachmentId(), accountId, sourcePath);
+        // The vault was opened/created/locked while the blob was being
+        // written. Its metadata belongs to the old document: never append it
+        // to the new vault (K-03).
+        if (epochRef.current !== startEpoch) {
+          return;
+        }
+        if (!isAttachmentMeta(meta)) {
+          setAttachmentError("Attachment operation failed.");
+          return;
+        }
+        setAttachments((current) => [...current, meta]);
+        commit();
+        setAttachmentNotice(`Attached ${meta.fileName} (${formatBytes(meta.sizeBytes)}).`);
+      } catch (error) {
+        if (epochRef.current === startEpoch) {
+          setAttachmentError(describeAttachmentError(error));
+        }
       }
-      setAttachments((current) => [...current, meta]);
-      commit();
-      setAttachmentNotice(`Attached ${meta.fileName} (${formatBytes(meta.sizeBytes)}).`);
-    } catch (error) {
-      setAttachmentError(describeAttachmentError(error));
+    })();
+    pendingImports.current.add(task);
+    try {
+      await task;
     } finally {
+      pendingImports.current.delete(task);
       setPickerBusy(false);
     }
   }
@@ -127,6 +164,7 @@ export function useAttachments({
     uploadAttachment,
     downloadAttachment,
     deleteAttachment,
+    waitForPending,
     resetUi,
   };
 }

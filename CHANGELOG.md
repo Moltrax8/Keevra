@@ -4,6 +4,65 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.0] - 2026-11-06
+
+Security and data-integrity release closing the ten findings (K-01…K-10) of
+the independent review of `066b1c3`, plus a window-close fix.
+
+### Security
+
+- **Complete, idempotent vault deletion (K-01).** Deleting an app-managed vault
+  now attempts the live file, every backup generation, the pre-restore copy and
+  the blob directory regardless of whether the live file still exists. The
+  registry listing is kept when any artifact remains, so "deleted" is never
+  reported while ciphertext is still on disk.
+- **Bounded KDF work on open (K-05).** Stored Argon2id parameters are accepted
+  only within 256 MiB / 6 passes / 4 lanes; a hostile header above that budget
+  is refused with the generic corruption error instead of freezing or
+  over-allocating. Package import is capped at 256 MiB, checked from metadata
+  before reading, and parsed straight from a buffered reader so the raw bytes
+  and parsed package are not held twice.
+- **Fail-closed attachment sweep (K-04).** Backup inspection now distinguishes
+  "file absent" from "file unreadable". If an existing backup cannot be
+  decrypted, the save-time blob sweep is skipped entirely instead of treating
+  the backup as empty and deleting blobs only it references.
+- **Pinned workflow actions (K-06).** Every third-party GitHub Action in CI and
+  release is pinned to a full 40-character commit SHA.
+- **TOTP codes masked by default (K-07).** Generated codes require an explicit
+  reveal that expires after 15 seconds and hides on window blur or tab
+  visibility loss.
+- **Backend session watchdog (K-08).** A Rust thread checks the idle clock every
+  5 seconds and drops the key at the 15-minute backstop even when the renderer
+  is suspended and sends no IPC.
+- **Per-vault pending attachment IDs (K-09).** Pending imports are keyed by
+  vault path, so two vaults using the same ID cannot protect or clear each
+  other's blobs.
+- **Redirect-checked update downloads (K-10).** A custom `reqwest` redirect
+  policy re-validates HTTPS and the GitHub host allow-list on every hop and
+  caps the chain at 10 redirects.
+
+### Fixed
+
+- **Window close on the lock screen.** The title-bar close button did nothing
+  while locked because the `core:window:allow-destroy` permission was missing
+  and the prevented close request never called `destroy()`. The permission is
+  granted and the handler now explicitly destroys the window in every state.
+- **Concurrent field saves no longer lose updates (K-02).** All account-field
+  edits are applied inside `setAccounts(current => …)`, so two blur handlers
+  flushing in the same tick keep both values instead of rebuilding from a stale
+  snapshot.
+- **Attachment imports cannot leak across vaults (K-03).** Uploads capture a
+  document epoch; a result that returns after open/create/lock is discarded
+  instead of being appended to the new document. Lock, close, export, package
+  import and settings-create wait for in-flight imports before switching.
+
+### Tests
+
+- New regression coverage for every finding above: partial-delete retry,
+  simultaneous field saves, stale import epoch, missing-vs-corrupt backup,
+  oversized KDF/package inputs, watchdog expiry, per-vault pending IDs, redirect
+  hops, and the close-button path.
+
 ## [0.1.0] - 2026-11-06
 
 ### Added
