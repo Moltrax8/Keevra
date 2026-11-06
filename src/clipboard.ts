@@ -1,9 +1,10 @@
 /**
  * Clipboard helpers for secret values.
  *
- * Copied secrets are wiped after a short delay, but only when the clipboard
- * still contains exactly what we put there. A newer copy made elsewhere is
- * never destroyed.
+ * Copied secrets are *attempted* to be wiped after a short delay, but only
+ * when the clipboard still contains exactly what we put there. Reads can be
+ * denied and Windows clipboard history may keep its own copy, so this is a
+ * best-effort mitigation, not a guarantee (K-13).
  */
 
 export const CLIPBOARD_CLEAR_MS = 30_000;

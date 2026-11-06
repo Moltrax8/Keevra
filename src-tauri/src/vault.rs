@@ -15,12 +15,19 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
+    io::Read as _,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 use zeroize::Zeroizing;
 
 pub const VAULT_VERSION: u32 = 1;
+/// Hard ceiling for a vault envelope file. A legitimate vault with a few
+/// thousand accounts stays far below this; a hostile or corrupt file is
+/// rejected before it is read into memory.
+pub const MAX_VAULT_BYTES: u64 = 64 * 1024 * 1024;
+/// Newest first: `.bak`, `.bak.1`, `.bak.2` — verified previous generations.
+const BACKUP_GENERATIONS: usize = 3;
 /// New-vault password floor, enforced here as well as in the UI.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 pub const KDF_MEMORY_KIB: u32 = 65536;
@@ -259,6 +266,81 @@ pub fn open_raw(
     Ok(buffer)
 }
 
+/// Maximum base64 length accepted for a ciphertext field, checked *before*
+/// decoding so a hostile envelope cannot force a huge allocation.
+const MAX_VAULT_B64_LEN: usize = ((MAX_VAULT_BYTES as usize + 2) / 3) * 4;
+
+/// Structural validation shared by open, restore, delete and package import.
+/// No password/KDF work happens here: only the envelope shape and its bounds.
+fn validate_envelope_shape(envelope: &VaultEnvelope) -> Result<(), VaultError> {
+    if envelope.version != VAULT_VERSION {
+        return Err(VaultError::UnsupportedVersion(envelope.version));
+    }
+    if envelope.kdf.alg != "argon2id"
+        || envelope.kdf.m == 0
+        || envelope.kdf.m > KDF_MAX_MEMORY_KIB
+        || envelope.kdf.t == 0
+        || envelope.kdf.t > KDF_MAX_ITERATIONS
+        || envelope.kdf.p == 0
+        || envelope.kdf.p > KDF_MAX_PARALLELISM
+    {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    let salt = B64
+        .decode(&envelope.kdf.salt_b64)
+        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    if salt.len() != SALT_LEN {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    let nonce = B64
+        .decode(&envelope.nonce_b64)
+        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    if nonce.len() != NONCE_LEN {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    if envelope.ciphertext_b64.is_empty() || envelope.ciphertext_b64.len() > MAX_VAULT_B64_LEN {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    Ok(())
+}
+
+/// Value-based variant used by package import before anything is written.
+pub fn validate_envelope_value(value: &serde_json::Value) -> Result<(), VaultError> {
+    let envelope: VaultEnvelope =
+        serde_json::from_value(value.clone()).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    validate_envelope_shape(&envelope)
+}
+
+/// Bounded file read. The metadata check rejects the common case cheaply and
+/// `take(limit + 1)` still protects against a file that grows after the check.
+pub(crate) fn read_limited(path: &Path, limit: u64, too_large: &str) -> Result<Vec<u8>, VaultError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            VaultError::NotFound
+        } else {
+            VaultError::Io(error.to_string())
+        }
+    })?;
+    if metadata.len() > limit {
+        return Err(VaultError::Io(too_large.to_string()));
+    }
+    let file = fs::File::open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            VaultError::NotFound
+        } else {
+            VaultError::Io(error.to_string())
+        }
+    })?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| VaultError::Io(error.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(VaultError::Io(too_large.to_string()));
+    }
+    Ok(bytes)
+}
+
 pub struct SealedVault {
     pub envelope_json: String,
 }
@@ -302,12 +384,9 @@ pub fn open_graph(
 > {
     let envelope: VaultEnvelope =
         serde_json::from_str(envelope_json).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    if envelope.version != VAULT_VERSION {
-        return Err(VaultError::UnsupportedVersion(envelope.version));
-    }
-    if envelope.kdf.alg != "argon2id" {
-        return Err(VaultError::WrongPasswordOrCorrupt);
-    }
+    // Shape and bounds first: an unsupported version, absurd KDF cost or
+    // oversized ciphertext must fail before any expensive work or allocation.
+    validate_envelope_shape(&envelope)?;
     // Honor the stored parameters (bounded above): old vaults keep opening
     // with their original cost, new vaults are sealed with current defaults.
     let salt_vec = B64
@@ -353,9 +432,7 @@ pub fn open_envelope_with_key(
 ) -> Result<GraphData, VaultError> {
     let envelope: VaultEnvelope =
         serde_json::from_str(envelope_json).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    if envelope.version != VAULT_VERSION {
-        return Err(VaultError::UnsupportedVersion(envelope.version));
-    }
+    validate_envelope_shape(&envelope)?;
     let nonce_vec = B64
         .decode(&envelope.nonce_b64)
         .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
@@ -385,12 +462,62 @@ pub fn validate_new_password(password: &str) -> Result<(), VaultError> {
     Ok(())
 }
 
-fn backup_path(path: &Path) -> PathBuf {    let mut backup = path.as_os_str().to_owned();
+fn backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_owned();
     backup.push(".bak");
     PathBuf::from(backup)
 }
 
+/// `.bak` is generation 0; `.bak.1` and `.bak.2` are older verified snapshots.
+fn backup_path_generation(path: &Path, generation: usize) -> PathBuf {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    if generation > 0 {
+        backup.push(format!(".{generation}"));
+    }
+    PathBuf::from(backup)
+}
+
+/// Every retained previous generation, newest first. Used by the orphan sweep
+/// so a blob referenced only by an older backup is never deleted.
+pub fn backup_paths(path: &Path) -> Vec<PathBuf> {
+    (0..BACKUP_GENERATIONS)
+        .map(|generation| backup_path_generation(path, generation))
+        .collect()
+}
+
+/// Recover the write lock even after a panic (poisoned mutex) so a failed
+/// command cannot make every later save/restore unreachable.
+pub(crate) fn vault_write_guard() -> MutexGuard<'static, ()> {
+    VAULT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn rotate_backups(path: &Path) -> Result<(), VaultError> {
+    // Oldest first so `.bak` -> `.bak.1` never clobbers `.bak.1` before it
+    // has been moved to `.bak.2`.
+    for generation in (0..BACKUP_GENERATIONS - 1).rev() {
+        let newer = backup_path_generation(path, generation);
+        let older = backup_path_generation(path, generation + 1);
+        if newer.exists() {
+            fs::rename(&newer, &older).map_err(|error| VaultError::Io(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy of the live vault kept when a backup is restored, so a restore of the
+/// wrong file (or a later change of mind) never destroys the current vault.
+fn pre_restore_path(path: &Path) -> PathBuf {
+    let mut recovery = path.as_os_str().to_owned();
+    recovery.push(".pre-restore");
+    PathBuf::from(recovery)
+}
+
 /// Atomic durable write: temp file in the same directory, flush, rename.
+/// Windows has no portable directory fsync; the replace-on-rename is the
+/// crash-safe step and the file contents are synced before it.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), VaultError> {
     write_atomic_bytes(path, contents.as_bytes())
 }
@@ -422,13 +549,8 @@ pub fn write_atomic_bytes(path: &Path, contents: &[u8]) -> Result<(), VaultError
 }
 
 pub fn read_vault_file(path: &Path) -> Result<String, VaultError> {
-    fs::read_to_string(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            VaultError::NotFound
-        } else {
-            VaultError::Io(e.to_string())
-        }
-    })
+    let bytes = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
+    String::from_utf8(bytes).map_err(|_| VaultError::WrongPasswordOrCorrupt)
 }
 
 /// Create a new vault. Refuses to overwrite an existing file.
@@ -444,9 +566,7 @@ pub fn create_vault(
     ),
     VaultError,
 > {
-    let _guard = VAULT_WRITE_LOCK
-        .lock()
-        .map_err(|e| VaultError::Io(e.to_string()))?;
+    let _guard = vault_write_guard();
     if path.exists() {
         return Err(VaultError::AlreadyExists);
     }
@@ -471,45 +591,85 @@ pub fn save_vault(
     salt: &[u8; SALT_LEN],
     cost: KdfCost,
 ) -> Result<(), VaultError> {
-    let _guard = VAULT_WRITE_LOCK
-        .lock()
-        .map_err(|e| VaultError::Io(e.to_string()))?;
+    let _guard = vault_write_guard();
     validate_graph(graph)?;
     let sealed = seal_graph(graph, key, salt, cost)?;
     // Actually decrypt and re-parse the new envelope with the session key
     // before replacing the old file; a bad seal must never reach disk.
     let _verified = open_envelope_with_key(&sealed.envelope_json, key)?;
     if path.exists() {
-        let backup = backup_path(path);
-        fs::copy(path, &backup).map_err(|e| VaultError::Io(e.to_string()))?;
+        // Preserve the previous vault only after proving it still opens, and
+        // rotate older generations so one bad copy cannot erase the last good
+        // backup. A current file that no longer verifies leaves the existing
+        // backup chain untouched.
+        let current = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
+        let verifies = std::str::from_utf8(&current)
+            .ok()
+            .is_some_and(|text| open_envelope_with_key(text, key).is_ok());
+        if verifies {
+            rotate_backups(path)?;
+            // Atomic temp + fsync + rename, exactly like the live file: a
+            // crash mid-copy can never leave a truncated `.bak`.
+            write_atomic_bytes(&backup_path(path), &current)?;
+        }
     }
     write_atomic(path, &sealed.envelope_json)?;
     Ok(())
 }
 
+/// Structural (non-decrypting) check that a file looks like a Keevra vault
+/// envelope. Destructive commands use this so an arbitrary text file that was
+/// registered by mistake can never be treated as a vault.
+pub fn looks_like_vault(path: &Path) -> bool {
+    let Ok(bytes) = read_limited(path, MAX_VAULT_BYTES, "vault_too_large") else {
+        return false;
+    };
+    let Ok(contents) = String::from_utf8(bytes) else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_str::<VaultEnvelope>(&contents) else {
+        return false;
+    };
+    validate_envelope_shape(&envelope).is_ok()
+}
+
 /// Explicit, never automatic, restore of the previous good vault.
-pub fn restore_backup(path: &Path) -> Result<(), VaultError> {
-    let _guard = VAULT_WRITE_LOCK
-        .lock()
-        .map_err(|e| VaultError::Io(e.to_string()))?;
+///
+/// The backup is opened with the user's password first: full AEAD
+/// authentication and schema validation must succeed before the live file is
+/// touched. The current vault is preserved as `<path>.pre-restore`.
+pub fn restore_backup(path: &Path, password: &[u8]) -> Result<(), VaultError> {
+    let _guard = vault_write_guard();
     let backup = backup_path(path);
     if !backup.exists() {
         return Err(VaultError::NotFound);
     }
-    let contents = fs::read(&backup).map_err(|e| VaultError::Io(e.to_string()))?;
-    write_atomic(path, &String::from_utf8_lossy(&contents))?;
+    let bytes = read_limited(&backup, MAX_VAULT_BYTES, "vault_too_large")?;
+    // Byte-preserving parse: `from_utf8_lossy` would silently rewrite a
+    // corrupted backup into something "valid" looking instead of rejecting it.
+    let contents = String::from_utf8(bytes).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    // Wrong password, tampered ciphertext, swapped header and an unsupported
+    // schema all fail here, before the live file changes.
+    open_graph(&contents, password)?;
+    if path.exists() {
+        let current = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
+        write_atomic_bytes(&pre_restore_path(path), &current)?;
+    }
+    write_atomic(path, &contents)?;
     Ok(())
 }
 
-pub fn backup_path_for(path: &Path) -> PathBuf {
-    backup_path(path)
+/// Current-vault copy kept by a verified restore; its blobs must survive the
+/// save-time orphan sweep so the rollback remains usable.
+pub fn pre_restore_path_for(path: &Path) -> PathBuf {
+    pre_restore_path(path)
 }
 
 /// Attachment IDs referenced by an encrypted vault file on disk, decrypted
 /// with the session key. Best-effort: any failure yields an empty list so
 /// callers retain rather than delete.
 pub fn attachment_ids_in_encrypted_file(path: &Path, key: &[u8; KEY_LEN]) -> Vec<String> {
-    let Ok(envelope_json) = fs::read_to_string(path) else {
+    let Ok(envelope_json) = read_vault_file(path) else {
         return Vec::new();
     };
     match open_envelope_with_key(&envelope_json, key) {
@@ -746,6 +906,104 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_wrong_password_and_corrupt_backup() {
+        let path = unique_path("restore-reject");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+        let password = b"correct horse battery";
+        let (_, salt, key, cost) = create_vault(&path, password).expect("create");
+        let first = doc(serde_json::json!({"accounts": []}));
+        save_vault(&path, &first, &key, &salt, cost).expect("save");
+        let live_before = fs::read(&path).expect("live");
+
+        assert_eq!(
+            restore_backup(&path, b"wrong password").expect_err("wrong password"),
+            VaultError::WrongPasswordOrCorrupt
+        );
+        assert_eq!(fs::read(&path).expect("live"), live_before);
+
+        // A truncated/corrupt backup must never reach the live path.
+        fs::write(backup_path(&path), b"{not a vault").expect("corrupt backup");
+        assert!(restore_backup(&path, password).is_err());
+        assert_eq!(fs::read(&path).expect("live"), live_before);
+
+        // Non-UTF8 bytes are rejected instead of being lossy-converted.
+        fs::write(backup_path(&path), [0xff, 0xfe, 0x00]).expect("binary backup");
+        assert_eq!(
+            restore_backup(&path, password).expect_err("non-utf8"),
+            VaultError::WrongPasswordOrCorrupt
+        );
+        assert_eq!(fs::read(&path).expect("live"), live_before);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+        let _ = fs::remove_file(pre_restore_path(&path));
+    }
+
+    #[test]
+    fn verified_restore_restores_backup_and_keeps_current_copy() {
+        let path = unique_path("restore-ok");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+        let _ = fs::remove_file(pre_restore_path(&path));
+        let password = b"correct horse battery";
+        let (_, salt, key, cost) = create_vault(&path, password).expect("create");
+        let first = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "a", "name": "A", "service": "", "tags": [], "fields": []}],
+        }));
+        save_vault(&path, &first, &key, &salt, cost).expect("save first");
+        let second = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "b", "name": "B", "service": "", "tags": [], "fields": []}],
+        }));
+        save_vault(&path, &second, &key, &salt, cost).expect("save second");
+        let live_before = fs::read(&path).expect("live");
+        let backup_before = fs::read(backup_path(&path)).expect("backup");
+        assert!(looks_like_vault(&path));
+        assert!(looks_like_vault(&backup_path(&path)));
+
+        restore_backup(&path, password).expect("verified restore");
+
+        // The live file is byte-identical to the verified backup...
+        assert_eq!(fs::read(&path).expect("live"), backup_before);
+        // ...the previous vault is preserved for a manual roll-back...
+        assert_eq!(fs::read(pre_restore_path(&path)).expect("recovery copy"), live_before);
+        // ...and the restored document is the first one.
+        let (restored, _, _, _) = open_graph(&read_vault_file(&path).expect("read"), password)
+            .expect("restored vault opens");
+        assert_eq!(
+            restored.get("accounts").and_then(|value| value.as_array()).map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            restored
+                .get("accounts")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("id")),
+            Some(&serde_json::json!("a"))
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+        let _ = fs::remove_file(pre_restore_path(&path));
+    }
+
+    #[test]
+    fn looks_like_vault_rejects_plain_files() {
+        let path = unique_path("shape-check");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"just a text file").expect("plain file");
+        assert!(!looks_like_vault(&path));
+        assert!(!looks_like_vault(&path.join("missing.vault")));
+        fs::remove_file(&path).expect("remove plain file");
+        let (_, _, _, _) = create_vault(&path, b"correct horse battery").expect("create");
+        assert!(looks_like_vault(&path));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn refuses_to_overwrite_on_create_and_bad_graph_on_save() {
         let path = unique_path("refuse");
         let _ = fs::remove_file(&path);
@@ -774,5 +1032,103 @@ mod tests {
         );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(backup_path(&path));
+    }
+
+    #[test]
+    fn limited_reads_reject_files_over_the_cap() {
+        let path = unique_path("limited-read");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, vec![b'a'; 32]).expect("fixture");
+        assert_eq!(
+            read_limited(&path, 32, "vault_too_large")
+                .expect("at the cap")
+                .len(),
+            32
+        );
+        let error = read_limited(&path, 31, "vault_too_large").expect_err("over the cap");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "vault_too_large"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(read_limited(&path, 64, "vault_too_large").expect("under").len(), 32);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn envelope_validation_rejects_placeholders_and_oversize_ciphertext() {
+        // A placeholder package envelope must not pass structural validation.
+        assert!(validate_envelope_value(&serde_json::json!({"version": 1})).is_err());
+        let envelope = serde_json::json!({
+            "version": VAULT_VERSION,
+            "kdf": {
+                "alg": "argon2id",
+                "m": KDF_MEMORY_KIB,
+                "t": KDF_ITERATIONS,
+                "p": KDF_PARALLELISM,
+                "salt_b64": B64.encode([0u8; SALT_LEN]),
+            },
+            "nonce_b64": B64.encode([0u8; NONCE_LEN]),
+            "ciphertext_b64": "A".repeat(MAX_VAULT_B64_LEN + 1),
+        });
+        assert!(validate_envelope_value(&envelope).is_err());
+    }
+
+    #[test]
+    fn backups_rotate_three_verified_generations() {
+        let path = unique_path("backup-rotation");
+        let _ = fs::remove_file(&path);
+        for generation in 0..BACKUP_GENERATIONS {
+            let _ = fs::remove_file(backup_path_generation(&path, generation));
+        }
+        // The created (empty) vault counts as the first live document.
+        let (_, salt, key, cost) = create_vault(&path, b"correct horse battery").expect("create");
+        for index in 0..4 {
+            let graph = doc(serde_json::json!({
+                "schemaVersion": 3,
+                "accounts": [{
+                    "id": format!("a{index}"),
+                    "name": format!("Account {index}"),
+                    "service": "",
+                    "tags": [],
+                    "fields": [],
+                }],
+            }));
+            save_vault(&path, &graph, &key, &salt, cost).expect("save");
+        }
+
+        let generations = backup_paths(&path);
+        assert_eq!(generations.len(), 3);
+        // After four saves: live = a3, .bak = a2, .bak.1 = a1, .bak.2 = a0.
+        for (expected_id, generation_path) in ["a2", "a1", "a0"].iter().zip(&generations) {
+            let (graph, _, _, _) = open_graph(
+                &read_vault_file(generation_path).expect("read generation"),
+                b"correct horse battery",
+            )
+            .expect("generation opens");
+            assert_eq!(
+                graph
+                    .get("accounts")
+                    .and_then(|value| value.as_array())
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("id")),
+                Some(&serde_json::json!(expected_id)),
+                "generation {generation_path:?}"
+            );
+        }
+        let (live, _, _, _) =
+            open_graph(&read_vault_file(&path).expect("read live"), b"correct horse battery")
+                .expect("live opens");
+        assert_eq!(
+            live.get("accounts")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("id")),
+            Some(&serde_json::json!("a3"))
+        );
+
+        for generation in &generations {
+            let _ = fs::remove_file(generation);
+        }
+        let _ = fs::remove_file(&path);
     }
 }

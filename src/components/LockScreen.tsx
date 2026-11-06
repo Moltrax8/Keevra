@@ -13,6 +13,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { VaultEntry } from "../vaultApi";
+import type { VaultDeleteOutcome } from "../hooks/useVaultSession";
 import { APP_NAME } from "../brand";
 import { shouldShowHint, strengthOf } from "../display";
 import { Logo } from "./bits";
@@ -43,12 +44,12 @@ export function LockScreen({
   notice: string | null;
   onCreate: (name: string, password: string, hint: string) => Promise<boolean>;
   onOpen: (path: string, password: string) => Promise<boolean>;
-  onRestore: (path: string) => void;
+  onRestore: (path: string, password: string) => void;
   onForget: (path: string) => void;
   onRemember: (name: string, path: string, hint: string) => Promise<boolean>;
   onRename: (path: string, name: string) => Promise<string | null>;
   onPickFile: () => Promise<string | null>;
-  onDeleteVault: (path: string) => Promise<string | null>;
+  onDeleteVault: (path: string) => Promise<VaultDeleteOutcome>;
 }) {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -66,6 +67,7 @@ export function LockScreen({
   const [failuresByPath, setFailuresByPath] = useState<Record<string, number>>({});
   const [lockoutSeconds, setLockoutSeconds] = useState(0);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [localNotice, setLocalNotice] = useState<string | null>(null);
 
   const defaultEntry = vaults.find((vault) => vault.path === defaultPath) ?? null;
   // Derived, never blank: default mode requires its entry; anything else
@@ -179,13 +181,14 @@ export function LockScreen({
       return;
     }
     setLocalError(null);
-    const message = await onDeleteVault(selectedPath);
-    if (message === null) {
+    const outcome = await onDeleteVault(selectedPath);
+    if (outcome.error === null) {
       setForgotConfirm("");
       setPassword("");
       setMode(defaultEntry ? "default" : "open");
+      setLocalNotice(outcome.notice);
     } else {
-      setLocalError(message);
+      setLocalError(outcome.error);
     }
   }
 
@@ -229,6 +232,7 @@ export function LockScreen({
     return (
       <>
         {localError ? <p className="create-form__error">{localError}</p> : null}
+        {localNotice ? <p className="notice-ok">{localNotice}</p> : null}
         {error ? <p className="create-form__error">{error}</p> : null}
         {notice ? <p className="notice-ok">{notice}</p> : null}
         {lockoutSeconds > 0 ? (
@@ -456,7 +460,7 @@ export function LockScreen({
                   type="button"
                   className="btn-secondary"
                   disabled={busy || selectedPath === ""}
-                  onClick={() => onRestore(selectedPath)}
+                  onClick={() => onRestore(selectedPath, password)}
                 >
                   Restore backup
                 </button>

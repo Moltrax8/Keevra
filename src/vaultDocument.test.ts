@@ -48,6 +48,15 @@ describe("migrateVaultGraph", () => {
       presets: [],
       attachments: [],
       serviceIcons: {},
+      // Legacy graph sections have no v3 equivalent and are kept verbatim so
+      // relationship/layout data is never silently discarded (K-11).
+      extraKeys: {
+        legacyGraph: {
+          nodes: stored.nodes,
+          relationships: stored.relationships,
+          layout: stored.layout,
+        },
+      },
     });
   });
 
@@ -140,6 +149,52 @@ describe("migrateVaultGraph", () => {
       customFlag: true,
     });
     expect(migrated.extraKeys).toEqual({ futureMetadata: { theme: "amber" }, customFlag: true });
+  });
+
+  it("preserves unknown nested keys for the next save", () => {
+    const migrated = migrateVaultGraph({
+      schemaVersion: 3,
+      accounts: [
+        {
+          id: "a",
+          name: "A",
+          service: "",
+          tags: [],
+          futureAccountFlag: 1,
+          fields: [
+            { id: "f", label: "L", type: "Text", value: "v", futureFieldFlag: "x" },
+          ],
+        },
+      ],
+      presets: [
+        {
+          id: "p",
+          name: "P",
+          service: "",
+          tags: [],
+          futurePresetFlag: true,
+          fields: [{ label: "U", type: "Username", futureBlueprintFlag: [1, 2] }],
+        },
+      ],
+    });
+    expect(migrated.accounts[0].extraKeys).toEqual({ futureAccountFlag: 1 });
+    expect(migrated.accounts[0].fields[0].extraKeys).toEqual({ futureFieldFlag: "x" });
+    expect(migrated.presets[0].extraKeys).toEqual({ futurePresetFlag: true });
+    expect(migrated.presets[0].fields[0].extraKeys).toEqual({ futureBlueprintFlag: [1, 2] });
+  });
+
+  it("keeps the legacy snapshot across repeated loads without duplicating it", () => {
+    const stored = {
+      schemaVersion: 2,
+      nodes: [{ id: "n", name: "N", type: "Account", fields: [] }],
+      relationships: [{ id: "r", sourceNodeId: "a", targetNodeId: "n" }],
+      layout: { n: { x: 0, y: 1 } },
+    };
+    const first = migrateVaultGraphReport(stored);
+    expect(first.warnings).toHaveLength(1);
+    const second = migrateVaultGraphReport(first.graph);
+    expect(second.graph.extraKeys).toEqual(first.graph.extraKeys);
+    expect(second.warnings).toEqual([]);
   });
 
   it("reports skipped records instead of dropping them silently", () => {

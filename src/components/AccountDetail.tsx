@@ -107,19 +107,32 @@ export function AccountDetail({
     savedIdentity.current = identityKey(account.name, account.service, account.tags.join(", "));
   }, [account.name, account.service, account.tags]);
 
-  function saveIdentity() {
+  function saveIdentity(): boolean {
     const key = identityKey(name, service, tagText);
-    if (key === savedIdentity.current) return;
+    if (key === savedIdentity.current) return false;
     const message = onSaveIdentity(name, service, tagText);
     setIdentityError(message);
-    if (message === null) savedIdentity.current = key;
+    if (message !== null) return false;
+    savedIdentity.current = key;
+    return true;
   }
 
-  // Same draft protection as FieldRow: pause-save plus close-time flush. Skip
-  // the pause-save while an identity input is focused so a save cannot
-  // re-render the form mid-typing; blur and close still save it.
+  // Same draft protection as FieldRow: pause-save plus close/lock-time flush.
+  // Skip the pause-save while an identity input is focused so a save cannot
+  // re-render the form mid-typing; blur and explicit flushes still save it.
   useEffect(() => {
-    const flush = () => saveIdentity();
+    const flush = (event?: Event) => {
+      const detail =
+        event instanceof CustomEvent
+          ? (event.detail as { changed?: boolean; failed?: boolean } | null)
+          : null;
+      const dirty = identityKey(name, service, tagText) !== savedIdentity.current;
+      if (saveIdentity()) {
+        if (detail !== null && typeof detail === "object") detail.changed = true;
+        return;
+      }
+      if (dirty && detail !== null && typeof detail === "object") detail.failed = true;
+    };
     window.addEventListener("keevra:flush-drafts", flush);
     const dirtyDraft = identityKey(name, service, tagText) !== savedIdentity.current;
     const focused =

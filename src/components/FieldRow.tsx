@@ -52,7 +52,20 @@ export function FieldRow({
   // focused row is left alone: blur/close already save it, and re-rendering
   // mid-typing would move the caret.
   useEffect(() => {
-    const flush = () => save();
+    const flush = (event?: Event) => {
+      const detail =
+        event instanceof CustomEvent
+          ? (event.detail as { changed?: boolean; failed?: boolean } | null)
+          : null;
+      const dirty = label !== saved.current.label || value !== saved.current.value;
+      if (save()) {
+        if (detail !== null && typeof detail === "object") detail.changed = true;
+        return;
+      }
+      // Still dirty after a refused save means the draft is invalid; report it
+      // so lock/close can wait instead of dropping the typed text.
+      if (dirty && detail !== null && typeof detail === "object") detail.failed = true;
+    };
     window.addEventListener("keevra:flush-drafts", flush);
     const dirtyDraft = label !== saved.current.label || value !== saved.current.value;
     const focused = rowRef.current !== null && rowRef.current.contains(document.activeElement);
@@ -88,17 +101,21 @@ export function FieldRow({
     };
   }, [field.type, field.value]);
 
-  function save() {
-    if (label === saved.current.label && value === saved.current.value) return;
+  function save(): boolean {
+    if (label === saved.current.label && value === saved.current.value) return false;
     const message = onSave(accountId, field.id, { label, value });
     setError(message);
-    if (message === null) saved.current = { label, value };
+    if (message !== null) return false;
+    saved.current = { label, value };
+    return true;
   }
 
   async function copyText(text: string) {
     try {
       await copySecretWithAutoClear(text);
-      setCopyNotice(`Copied. Clipboard clears in ${Math.round(CLIPBOARD_CLEAR_MS / 1000)}s.`);
+      setCopyNotice(
+        `Copied. The app tries to clear the clipboard in ${Math.round(CLIPBOARD_CLEAR_MS / 1000)}s; Windows clipboard history may keep a copy.`,
+      );
     } catch {
       setCopyNotice("Copy failed.");
     }

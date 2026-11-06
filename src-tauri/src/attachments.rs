@@ -13,15 +13,55 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::SystemTime,
 };
 
-use crate::vault::{open_raw, seal_raw, VaultError};
+use crate::vault::{open_raw, read_limited, seal_raw, VaultError};
 
 pub const ATTACHMENT_VERSION: u32 = 1;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// In-memory preview cap (downloads still allow the full 25 MiB).
 pub const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+/// Base64 of the largest ciphertext plus JSON envelope overhead.
+pub(crate) const MAX_BLOB_ENVELOPE_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Serializes blob writes with sweeps so a save-time sweep can never delete a
+/// blob that an import is still writing (K-05).
+static ATTACHMENT_IO_LOCK: Mutex<()> = Mutex::new(());
+
+/// Imports that returned to the frontend but whose metadata has not reached
+/// the vault document yet. The sweep must retain these until a save lists them.
+static PENDING_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub(crate) fn lock_attachments() -> MutexGuard<'static, ()> {
+    ATTACHMENT_IO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn mark_pending(id: &str) {
+    let mut pending = PENDING_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !pending.iter().any(|existing| existing == id) {
+        pending.push(id.to_string());
+    }
+}
+
+fn clear_pending(id: &str) {
+    let mut pending = PENDING_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.retain(|existing| existing != id);
+}
+
+fn pending_ids() -> Vec<String> {
+    PENDING_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +80,32 @@ struct AttachmentBlob {
     version: u32,
     nonce_b64: String,
     ciphertext_b64: String,
+}
+
+const MAX_BLOB_B64_LEN: usize = ((MAX_ATTACHMENT_BYTES as usize + 16 + 2) / 3) * 4;
+
+/// Structural blob validation used by package import: no key needed, but the
+/// version, nonce size and bounded ciphertext are checked before staging.
+fn validate_blob_shape(blob: &AttachmentBlob) -> Result<(), VaultError> {
+    if blob.version != ATTACHMENT_VERSION {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    let nonce = B64
+        .decode(&blob.nonce_b64)
+        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    if nonce.len() != 24 {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    if blob.ciphertext_b64.is_empty() || blob.ciphertext_b64.len() > MAX_BLOB_B64_LEN {
+        return Err(VaultError::WrongPasswordOrCorrupt);
+    }
+    Ok(())
+}
+
+pub fn validate_blob_value(value: &serde_json::Value) -> Result<(), VaultError> {
+    let blob: AttachmentBlob =
+        serde_json::from_value(value.clone()).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    validate_blob_shape(&blob)
 }
 
 const ATTACHMENT_AAD_PREFIX: &[u8] = b"keevra-attachment-v1:";
@@ -105,39 +171,46 @@ pub fn attachment_import(
     if !is_valid_attachment_id(attachment_id) {
         return Err(VaultError::Io("invalid_attachment_id".to_string()));
     }
-    let bytes = fs::read(source_path).map_err(|e| VaultError::Io(e.to_string()))?;
-    if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
-        return Err(VaultError::Io("attachment_too_large".to_string()));
+    let _guard = lock_attachments();
+    // Publish the ID before the blob becomes visible so a concurrent sweep
+    // retains it even if the frontend has not committed metadata yet.
+    mark_pending(attachment_id);
+    let result = (|| -> Result<AttachmentMeta, VaultError> {
+        let bytes = read_limited(source_path, MAX_ATTACHMENT_BYTES, "attachment_too_large")?;
+        let file_name = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| VaultError::Io("invalid_file_name".to_string()))?;
+        let mime_type = mime_guess::from_path(source_path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        let (nonce, ciphertext) = seal_raw(&bytes, key, &attachment_aad(attachment_id))?;
+        let blob = AttachmentBlob {
+            version: ATTACHMENT_VERSION,
+            nonce_b64: B64.encode(nonce),
+            ciphertext_b64: B64.encode(&ciphertext),
+        };
+        let dir = attachments_dir(vault_path);
+        fs::create_dir_all(&dir).map_err(|e| VaultError::Io(e.to_string()))?;
+        let envelope =
+            serde_json::to_string_pretty(&blob).map_err(|e| VaultError::Io(e.to_string()))?;
+        crate::vault::write_atomic(&blob_path(vault_path, attachment_id), &envelope)?;
+        Ok(AttachmentMeta {
+            id: attachment_id.to_string(),
+            node_id: node_id.to_string(),
+            file_name,
+            mime_type,
+            size_bytes: bytes.len() as u64,
+            sha256_hex: sha256_hex(&bytes),
+            created_at_ms: now_ms(),
+        })
+    })();
+    if result.is_err() {
+        clear_pending(attachment_id);
     }
-    let file_name = source_path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| VaultError::Io("invalid_file_name".to_string()))?;
-    let mime_type = mime_guess::from_path(source_path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-    let (nonce, ciphertext) = seal_raw(&bytes, key, &attachment_aad(attachment_id))?;
-    let blob = AttachmentBlob {
-        version: ATTACHMENT_VERSION,
-        nonce_b64: B64.encode(nonce),
-        ciphertext_b64: B64.encode(&ciphertext),
-    };
-    let dir = attachments_dir(vault_path);
-    fs::create_dir_all(&dir).map_err(|e| VaultError::Io(e.to_string()))?;
-    let envelope =
-        serde_json::to_string_pretty(&blob).map_err(|e| VaultError::Io(e.to_string()))?;
-    crate::vault::write_atomic(&blob_path(vault_path, attachment_id), &envelope)?;
-    Ok(AttachmentMeta {
-        id: attachment_id.to_string(),
-        node_id: node_id.to_string(),
-        file_name,
-        mime_type,
-        size_bytes: bytes.len() as u64,
-        sha256_hex: sha256_hex(&bytes),
-        created_at_ms: now_ms(),
-    })
+    result
 }
 
 /// Exports a blob after verifying it against expected metadata. The hash
@@ -149,7 +222,7 @@ pub fn attachment_export(
     expected_sha256: &str,
     dest_path: &Path,
 ) -> Result<u64, VaultError> {
-    let plaintext = decrypt_blob_bytes(key, vault_path, attachment_id, expected_sha256)?;
+    let plaintext = decrypt_blob_bytes(key, vault_path, attachment_id, expected_sha256, None)?;
     crate::vault::write_atomic_bytes(dest_path, &plaintext)?;
     Ok(plaintext.len() as u64)
 }
@@ -170,10 +243,13 @@ pub fn attachment_read(
     attachment_id: &str,
     expected_sha256: &str,
 ) -> Result<AttachmentPreview, VaultError> {
-    let plaintext = decrypt_blob_bytes(key, vault_path, attachment_id, expected_sha256)?;
-    if plaintext.len() as u64 > MAX_PREVIEW_BYTES {
-        return Err(VaultError::Io("attachment_too_large_for_preview".to_string()));
-    }
+    let plaintext = decrypt_blob_bytes(
+        key,
+        vault_path,
+        attachment_id,
+        expected_sha256,
+        Some(MAX_PREVIEW_BYTES),
+    )?;
     Ok(AttachmentPreview {
         bytes_b64: B64.encode(&plaintext),
         sha256_hex: sha256_hex(&plaintext),
@@ -186,22 +262,28 @@ fn decrypt_blob_bytes(
     vault_path: &Path,
     attachment_id: &str,
     expected_sha256: &str,
+    max_plaintext: Option<u64>,
 ) -> Result<Vec<u8>, VaultError> {
     if !is_valid_attachment_id(attachment_id) {
         return Err(VaultError::Io("invalid_attachment_id".to_string()));
     }
-    let envelope_json = fs::read_to_string(blob_path(vault_path, attachment_id)).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            VaultError::Io("attachment_not_found".to_string())
-        } else {
-            VaultError::Io(e.to_string())
+    let envelope_json = read_limited(
+        &blob_path(vault_path, attachment_id),
+        MAX_BLOB_ENVELOPE_BYTES,
+        "attachment_too_large",
+    )
+    .map_err(|error| match error {
+        VaultError::NotFound => VaultError::Io("attachment_not_found".to_string()),
+        VaultError::Io(message) if message.contains("attachment_too_large") => {
+            VaultError::Io("attachment_corrupt".to_string())
         }
+        other => other,
     })?;
+    let envelope_text =
+        String::from_utf8(envelope_json).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
     let blob: AttachmentBlob =
-        serde_json::from_str(&envelope_json).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    if blob.version != ATTACHMENT_VERSION {
-        return Err(VaultError::Io("attachment_corrupt".to_string()));
-    }
+        serde_json::from_str(&envelope_text).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    validate_blob_shape(&blob)?;
     let nonce_vec = B64
         .decode(&blob.nonce_b64)
         .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
@@ -211,6 +293,11 @@ fn decrypt_blob_bytes(
     let ciphertext = B64
         .decode(&blob.ciphertext_b64)
         .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    if let Some(max) = max_plaintext {
+        if ciphertext.len() as u64 > max.saturating_add(16) {
+            return Err(VaultError::Io("attachment_too_large_for_preview".to_string()));
+        }
+    }
     let plaintext = match open_raw(&ciphertext, key, &nonce, &attachment_aad(attachment_id)) {
         Ok(plaintext) => plaintext,
         Err(_) => open_raw(
@@ -220,6 +307,9 @@ fn decrypt_blob_bytes(
             &legacy_attachment_aad(attachment_id),
         )?,
     };
+    if max_plaintext.is_some_and(|max| plaintext.len() as u64 > max) {
+        return Err(VaultError::Io("attachment_too_large_for_preview".to_string()));
+    }
     if sha256_hex(&plaintext) != expected_sha256 {
         return Err(VaultError::Io("attachment_corrupt".to_string()));
     }
@@ -242,8 +332,52 @@ pub fn live_attachment_ids(
         .unwrap_or_default()
 }
 
+/// `(id, sha256)` pairs referenced by the vault document.
+pub fn attachment_metadata(
+    document: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    document
+        .get("attachments")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_str()?.to_string();
+                    let sha = item.get("sha256Hex")?.as_str()?.to_string();
+                    Some((id, sha))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decrypts a blob and verifies its plaintext hash without keeping the bytes.
+/// Package export uses this so a tampered or inconsistent blob is never
+/// published inside an otherwise valid package (K-09).
+pub fn verify_attachment(
+    key: &[u8; 32],
+    vault_path: &Path,
+    attachment_id: &str,
+    expected_sha256: &str,
+) -> Result<(), VaultError> {
+    decrypt_blob_bytes(key, vault_path, attachment_id, expected_sha256, None).map(|_| ())
+}
+
 /// Removes blobs with no live metadata record. Returns removals count.
+///
+/// Runs under the same lock as imports, and never deletes an ID that an import
+/// has published but not yet committed to the vault document (K-05).
 pub fn attachment_sweep(vault_path: &Path, live_ids: &[String]) -> usize {
+    let _guard = lock_attachments();
+    {
+        let mut pending = PENDING_IDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A live ID is committed metadata, so it is no longer pending.
+        pending.retain(|id| !live_ids.iter().any(|live| live == id));
+    }
+    let pending = pending_ids();
     let dir = attachments_dir(vault_path);
     let entries = fs::read_dir(&dir).map(|read| {
         read.filter_map(|entry| entry.ok()).collect::<Vec<_>>()
@@ -257,6 +391,7 @@ pub fn attachment_sweep(vault_path: &Path, live_ids: &[String]) -> usize {
             }
             let id = name.trim_end_matches(".bin");
             if !live_ids.iter().any(|live| live == id)
+                && !pending.iter().any(|held| held == id)
                 && fs::remove_file(entry.path()).is_ok()
             {
                 removed += 1;
@@ -299,6 +434,13 @@ mod tests {
         let bytes = attachment_export(&key(), &vault, "att-1", &meta.sha256_hex, &dest).expect("export");
         assert_eq!(bytes, 20);
         assert_eq!(fs::read(&dest).expect("read back"), b"attachment-bytes-123");
+        // Imports stay pending until a save lists them, so a sweep before that
+        // must retain the blob (K-05)...
+        assert_eq!(attachment_sweep(&vault, &[]), 0);
+        assert!(blob_path(&vault, "att-1").exists());
+        // ...and a save that lists the ID commits it, after which an orphan
+        // sweep may remove it.
+        assert_eq!(attachment_sweep(&vault, &["att-1".to_string()]), 0);
         assert_eq!(attachment_sweep(&vault, &[]), 1);
         assert!(!blob_path(&vault, "att-1").exists());
         assert_eq!(attachment_sweep(&vault, &[]), 0);
@@ -368,6 +510,11 @@ mod tests {
         assert!(attachment_read(&key(), &vault, "../escape", "x").is_err());
         attachment_import(&key(), &vault, "keep-1", "node-1", &small).expect("import");
         attachment_import(&key(), &vault, "drop-1", "node-1", &small).expect("import");
+        // Commit both imports, then sweep all orphans: only "keep-1" survives.
+        assert_eq!(
+            attachment_sweep(&vault, &["keep-1".to_string(), "drop-1".to_string()]),
+            0
+        );
         assert_eq!(
             attachment_sweep(&vault, &["keep-1".to_string()]),
             1

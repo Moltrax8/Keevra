@@ -48,8 +48,11 @@ This document is the authority for the update channel alongside
 ## Release process (maintainer)
 
 1. Build the installer from the release tag with locked dependencies
-   (`npm ci`, `cargo build --locked`). The repository currently verifies
-   `main` in CI; a tagged release workflow is not included yet.
+   (`npm ci`, `cargo build --locked`). Pushing a `v<version>` tag runs
+   `.github/workflows/release.yml`, which refuses to build unless the
+   Authenticode certificate is configured (see `docs/RELEASE_SECURITY.md`).
+   The workflow creates a **draft** release containing the signed installer,
+   SBOMs and provenance attestations.
 2. Compute SHA256 of `*-setup.exe`; write `updates.json`:
    `{"version":"0.3.0","assets":[{"name":"<exe>","sha256":"<hex>"}]}`
    (`version` must equal the release tag modulo leading `v`).
@@ -76,9 +79,15 @@ This document is the authority for the update channel alongside
 
 ## Provenance (current limits)
 
-- Today's gate is **signature + version + host + hash**. Full provenance
-  (CI attestations/SBOM) is out of scope for this pre-1.0 build. The design
-  accepts it without changing the client flow.
+- Today's gate is **signature + version + host + hash**. CI now runs
+  `npm audit` and the RustSec audit, and publishes CycloneDX SBOMs for both
+  dependency graphs (see `docs/RELEASE_SECURITY.md`).
+- Installers are **not Authenticode-signed yet**; that requires a certificate
+  supplied by the project owner. Until then a release must not claim a signed
+  publisher identity, and SmartScreen will warn on first install.
+- Full provenance (SLSA attestations / reproducible builds) is out of scope
+  for this pre-1.0 build. The design accepts it without changing the client
+  flow.
 - On suspected compromise: rotate GitHub credentials, revoke/rotate the
   signing key per above, publish an out-of-band notice, and treat any
   installer downloaded before rotation as untrusted.

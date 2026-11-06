@@ -39,16 +39,22 @@ export const FIELD_TYPES: readonly FieldType[] = [
 /** Field types whose values are masked in the UI until explicitly revealed. */
 export const SECRET_FIELD_TYPES: readonly FieldType[] = ["Password", "Secret", "PIN", "TOTP", "RecoveryCodes"];
 
+/** Unknown nested keys preserved verbatim across migration and saves. */
+export type PreservedKeys = Record<string, unknown>;
+
 export interface Field {
   readonly id: FieldId;
   label: string;
   type: FieldType;
   value: string;
+  /** Fields this build does not understand, carried forward losslessly. */
+  extraKeys?: PreservedKeys;
 }
 
 export interface TypeFieldBlueprint {
   label: string;
   type: FieldType;
+  extraKeys?: PreservedKeys;
 }
 
 export interface PresetFieldBlueprint extends TypeFieldBlueprint {
@@ -70,6 +76,8 @@ export interface Account {
   service: string;
   tags: string[];
   fields: Field[];
+  /** Unknown account keys preserved verbatim. */
+  extraKeys?: PreservedKeys;
 }
 
 /** Reusable account shape. Instantiating one creates an ordinary Account. */
@@ -79,6 +87,8 @@ export interface AccountPreset {
   service: string;
   tags: string[];
   fields: PresetFieldBlueprint[];
+  /** Unknown preset keys preserved verbatim. */
+  extraKeys?: PreservedKeys;
 }
 
 /**

@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs, path::Path};
 
-use crate::vault::{backup_path_for, write_atomic, VaultError};
+use crate::vault::{read_limited, write_atomic, VaultError};
 
 pub const PACKAGE_VERSION: u32 = 1;
 pub const PACKAGE_FORMAT: &str = "keevra-package";
@@ -37,11 +37,43 @@ struct Package {
 }
 
 /// Exports the vault file at `vault_path` plus its sidecar blobs to
-/// `dest_path` (atomic). Returns the blob count. Never decrypts.
-pub fn export_package(vault_path: &Path, dest_path: &Path) -> Result<usize, VaultError> {
-    let envelope_text = fs::read_to_string(vault_path).map_err(|e| VaultError::Io(e.to_string()))?;
+/// `dest_path` (atomic). Returns the blob count. Never decrypts unless a
+/// session key is supplied: with a key, only blobs referenced by the current
+/// document are included and every blob envelope is structurally verified.
+///
+/// The vault-file lock plus the attachment lock give the export a consistent
+/// snapshot against concurrent saves, imports and sweeps (K-09).
+pub fn export_package(
+    vault_path: &Path,
+    dest_path: &Path,
+    key: Option<&[u8; 32]>,
+) -> Result<usize, VaultError> {
+    let _vault_guard = crate::vault::vault_write_guard();
+    let _attachment_guard = crate::attachments::lock_attachments();
+    let envelope_text = crate::vault::read_vault_file(vault_path)?;
     let envelope: serde_json::Value =
         serde_json::from_str(&envelope_text).map_err(|e| VaultError::Io(e.to_string()))?;
+    crate::vault::validate_envelope_value(&envelope)?;
+    // With a session key, take the metadata from the *same* decrypted
+    // document and prove every referenced blob still decrypts to its recorded
+    // hash before packaging it. Concurrent writes hold both locks below, so
+    // the exported set always matches the exported document (K-09).
+    let live_ids = match key {
+        Some(key) => {
+            let graph = crate::vault::open_envelope_with_key(&envelope_text, key)?;
+            let metadata = crate::attachments::attachment_metadata(&graph.0);
+            for (id, sha) in &metadata {
+                crate::attachments::verify_attachment(key, vault_path, id, sha)?;
+            }
+            Some(
+                metadata
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<String>>(),
+            )
+        }
+        None => None,
+    };
     let file_name = vault_path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -56,9 +88,21 @@ pub fn export_package(vault_path: &Path, dest_path: &Path) -> Result<usize, Vaul
                 continue;
             }
             let id = name.trim_end_matches(".bin").to_string();
-            let text = fs::read_to_string(entry.path()).map_err(|e| VaultError::Io(e.to_string()))?;
+            if let Some(live) = &live_ids {
+                if !live.iter().any(|live_id| live_id == &id) {
+                    continue;
+                }
+            }
+            let blob_bytes = read_limited(
+                &entry.path(),
+                crate::attachments::MAX_BLOB_ENVELOPE_BYTES,
+                "attachment_too_large",
+            )?;
+            let blob_text = String::from_utf8(blob_bytes)
+                .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
             let blob: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| VaultError::Io(e.to_string()))?;
+                serde_json::from_str(&blob_text).map_err(|e| VaultError::Io(e.to_string()))?;
+            crate::attachments::validate_blob_value(&blob)?;
             attachments.push(BlobEntry { id, envelope: blob });
         }
     }
@@ -73,8 +117,6 @@ pub fn export_package(vault_path: &Path, dest_path: &Path) -> Result<usize, Vaul
     };
     let text = serde_json::to_string_pretty(&package).map_err(|e| VaultError::Io(e.to_string()))?;
     write_atomic(dest_path, &text)?;
-    // Touch nothing else: export must not delete or rotate the backup.
-    let _ = backup_path_for(vault_path);
     Ok(count)
 }
 
@@ -92,11 +134,8 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
     if dest_vault_path.exists() {
         return Err(VaultError::AlreadyExists);
     }
-    let metadata = fs::metadata(source_path).map_err(|e| VaultError::Io(e.to_string()))?;
-    if metadata.len() > MAX_PACKAGE_BYTES {
-        return Err(VaultError::Io("package_too_large".to_string()));
-    }
-    let text = fs::read_to_string(source_path).map_err(|e| VaultError::Io(e.to_string()))?;
+    let bytes = read_limited(source_path, MAX_PACKAGE_BYTES, "package_too_large")?;
+    let text = String::from_utf8(bytes).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
     let package: Package = serde_json::from_str(&text).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
     // Accept the current format and the legacy name so old exports still import.
     if (package.format != PACKAGE_FORMAT && package.format != LEGACY_PACKAGE_FORMAT)
@@ -104,14 +143,23 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
     {
         return Err(VaultError::Io("unsupported_package_version".to_string()));
     }
-    if package.vault_file_name.trim().is_empty() || package.attachments.len() > MAX_PACKAGE_ATTACHMENTS {
+    if package.vault_file_name.trim().is_empty()
+        || package.vault_file_name.len() > 200
+        || package.vault_file_name.contains('/')
+        || package.vault_file_name.contains('\\')
+        || package.vault_file_name.contains("..")
+        || package.vault_file_name.chars().any(|c| c.is_control())
+        || package.attachments.len() > MAX_PACKAGE_ATTACHMENTS
+    {
         return Err(VaultError::Io("invalid_package".to_string()));
     }
+    // Structural validation of the encrypted envelope: version, KDF algorithm
+    // and bounds, salt/nonce sizes and ciphertext size. This is not a password
+    // check (that happens when the user opens the vault), but it stops a
+    // "successful" import of an unopenable file (K-08).
+    crate::vault::validate_envelope_value(&package.vault_envelope)?;
     let envelope_text =
         serde_json::to_string_pretty(&package.vault_envelope).map_err(|e| VaultError::Io(e.to_string()))?;
-    // Validate envelope shape without decrypting.
-    let _: serde_json::Value =
-        serde_json::from_str(&envelope_text).map_err(|e| VaultError::Io(e.to_string()))?;
 
     // Serialize and validate every blob up front.
     let mut blobs: Vec<(String, String)> = Vec::with_capacity(package.attachments.len());
@@ -120,6 +168,7 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
         if !crate::attachments::is_valid_attachment_id(&entry.id) || !seen.insert(entry.id.as_str()) {
             return Err(VaultError::Io("invalid_package".to_string()));
         }
+        crate::attachments::validate_blob_value(&entry.envelope)?;
         let blob_text =
             serde_json::to_string_pretty(&entry.envelope).map_err(|e| VaultError::Io(e.to_string()))?;
         blobs.push((entry.id.clone(), blob_text));
@@ -167,35 +216,128 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::{create_vault, read_vault_file};
+
+    fn create_real_vault(path: &Path) -> ([u8; 32], [u8; 16], crate::vault::KdfCost) {
+        let (_graph, salt, key, cost) =
+            create_vault(path, b"correct horse battery").expect("create vault");
+        (*key, salt, cost)
+    }
+
+    fn envelope_value(vault: &Path) -> serde_json::Value {
+        serde_json::from_str(&read_vault_file(vault).expect("read vault")).expect("envelope")
+    }
+
+    fn import_blob(
+        vault: &Path,
+        key: &[u8; 32],
+        id: &str,
+        dir: &Path,
+    ) -> (serde_json::Value, String) {
+        let source = dir.join(format!("{id}.src"));
+        fs::write(&source, b"attachment-bytes").expect("fixture");
+        let meta = crate::attachments::attachment_import(key, vault, id, "node-1", &source)
+            .expect("import");
+        let blob_path = crate::attachments::attachments_dir(vault).join(format!("{id}.bin"));
+        let envelope =
+            serde_json::from_str(&fs::read_to_string(blob_path).expect("blob")).expect("blob json");
+        (envelope, meta.sha256_hex)
+    }
 
     #[test]
     fn export_import_roundtrip() {
         let dir = std::env::temp_dir().join(format!("keevra-pkg-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
         let vault = dir.join("a.vault");
-        fs::write(&vault, serde_json::json!({"version": 1}).to_string()).expect("vault");
-        let att_dir = crate::attachments::attachments_dir(&vault);
-        fs::create_dir_all(&att_dir).expect("att dir");
-        fs::write(att_dir.join("x.bin"), r#"{"version":1}"#).expect("blob");
+        let (key, salt, cost) = create_real_vault(&vault);
+        let (_blob, sha) = import_blob(&vault, &key, "x", &dir);
+        // Reference the blob from the document so a keyed export includes it.
+        let graph: crate::vault::GraphData = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [],
+            "presets": [],
+            "serviceIcons": {},
+            "attachments": [{
+                "id": "x",
+                "nodeId": "node-1",
+                "fileName": "x.src",
+                "mimeType": "application/octet-stream",
+                "sizeBytes": 16,
+                "sha256Hex": sha,
+                "createdAtMs": 0
+            }]
+        }))
+        .expect("graph");
+        crate::vault::save_vault(&vault, &graph, &key, &salt, cost).expect("save");
+        let envelope = envelope_value(&vault);
         let dest = dir.join("export.vtpkg.json");
-        let count = export_package(&vault, &dest).expect("export");
+        let count = export_package(&vault, &dest, Some(&key)).expect("export");
         assert_eq!(count, 1);
+        // The exported envelope is the real encrypted vault, not a placeholder.
+        let package: Package =
+            serde_json::from_str(&fs::read_to_string(&dest).expect("package")).expect("parse");
+        assert_eq!(package.vault_envelope, envelope);
         let restored = dir.join("b.vault");
         let imported = import_package(&dest, &restored).expect("import");
         assert_eq!(imported.attachment_count, 1);
-        assert!(att_dir.join("x.bin").exists() || crate::attachments::attachments_dir(&restored).join("x.bin").exists());
+        assert!(crate::attachments::attachments_dir(&restored).join("x.bin").exists());
         assert!(import_package(&dest, &restored).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_refuses_a_tampered_referenced_blob() {
+        let dir = std::env::temp_dir().join(format!("keevra-pkgtamper-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let vault = dir.join("a.vault");
+        let (key, salt, cost) = create_real_vault(&vault);
+        let (_blob, sha) = import_blob(&vault, &key, "x", &dir);
+        let graph: crate::vault::GraphData = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [],
+            "presets": [],
+            "serviceIcons": {},
+            "attachments": [{
+                "id": "x",
+                "nodeId": "node-1",
+                "fileName": "x.src",
+                "mimeType": "application/octet-stream",
+                "sizeBytes": 16,
+                "sha256Hex": sha,
+                "createdAtMs": 0
+            }]
+        }))
+        .expect("graph");
+        crate::vault::save_vault(&vault, &graph, &key, &salt, cost).expect("save");
+
+        // Flip one ciphertext character: the blob still parses structurally but
+        // no longer authenticates, so export must refuse instead of publishing
+        // a package whose attachment cannot be opened (K-09).
+        let blob_path = crate::attachments::attachments_dir(&vault).join("x.bin");
+        let mut blob: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&blob_path).expect("blob")).expect("json");
+        let ciphertext = blob["ciphertext_b64"].as_str().expect("ciphertext");
+        let tampered = format!("{}{}", if ciphertext.starts_with('A') { "B" } else { "A" }, &ciphertext[1..]);
+        blob["ciphertext_b64"] = serde_json::Value::String(tampered);
+        fs::write(&blob_path, serde_json::to_string(&blob).expect("json")).expect("tamper");
+
+        let dest = dir.join("export.vtpkg.json");
+        assert!(export_package(&vault, &dest, Some(&key)).is_err());
+        assert!(!dest.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn legacy_package_format_still_imports() {
         let dir = std::env::temp_dir().join(format!("keevra-pkglegacy-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
         let vault = dir.join("a.vault");
-        fs::write(&vault, serde_json::json!({"version": 1}).to_string()).expect("vault");
+        create_real_vault(&vault);
         let dest = dir.join("export.vtpkg.json");
-        export_package(&vault, &dest).expect("export");
+        export_package(&vault, &dest, None).expect("export");
         let text = fs::read_to_string(&dest).expect("read");
         let legacy = text.replace(PACKAGE_FORMAT, LEGACY_PACKAGE_FORMAT);
         fs::write(&dest, legacy).expect("write legacy");
@@ -209,10 +351,33 @@ mod tests {
     #[test]
     fn rejects_bad_packages() {
         let dir = std::env::temp_dir().join(format!("keevra-pkgbad-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let seed = dir.join("seed.vault");
+        let (key, _salt, _cost) = create_real_vault(&seed);
+        let envelope = envelope_value(&seed);
+        let (real_blob, _sha) = import_blob(&seed, &key, "good", &dir);
+
         let bad = dir.join("bad.json");
         fs::write(&bad, r#"{"format":"nope","version":99}"#).expect("bad");
         assert!(import_package(&bad, &dir.join("c.vault")).is_err());
+
+        // A placeholder envelope (`{"version":1}`) must now be rejected.
+        let placeholder = dir.join("placeholder.json");
+        fs::write(
+            &placeholder,
+            serde_json::json!({
+                "format": PACKAGE_FORMAT,
+                "version": 1,
+                "vaultFileName": "x.vault",
+                "vaultEnvelope": {"version": 1},
+                "attachments": [],
+            })
+            .to_string(),
+        )
+        .expect("placeholder");
+        assert!(import_package(&placeholder, &dir.join("p.vault")).is_err());
+
         let traversal = dir.join("traversal.json");
         fs::write(
             &traversal,
@@ -220,14 +385,16 @@ mod tests {
                 "format": PACKAGE_FORMAT,
                 "version": 1,
                 "vaultFileName": "x.vault",
-                "vaultEnvelope": {"version": 1},
-                "attachments": [{"id": "../escape", "envelope": {"version": 1}}],
+                "vaultEnvelope": envelope,
+                "attachments": [{"id": "../escape", "envelope": real_blob}],
             })
             .to_string(),
         )
         .expect("traversal fixture");
         assert!(import_package(&traversal, &dir.join("d.vault")).is_err());
-        // A bad entry after a good one must leave no partial vault or blobs.
+
+        // A structurally invalid blob after a valid one must leave no partial
+        // vault or blobs behind.
         let partial = dir.join("partial.json");
         fs::write(
             &partial,
@@ -235,10 +402,10 @@ mod tests {
                 "format": "vaulttrax-package",
                 "version": 1,
                 "vaultFileName": "x.vault",
-                "vaultEnvelope": {"version": 1},
+                "vaultEnvelope": envelope_value(&seed),
                 "attachments": [
-                    {"id": "good", "envelope": {"version": 1}},
-                    {"id": "../escape", "envelope": {"version": 1}},
+                    {"id": "good", "envelope": real_blob},
+                    {"id": "bad", "envelope": {"version": 1}},
                 ],
             })
             .to_string(),

@@ -35,6 +35,11 @@ export async function vaultList(): Promise<VaultEntry[]> {
   return invoke<VaultEntry[]>("vault_list");
 }
 
+/** Reports genuine user activity to the backend inactivity backstop (K-14). */
+export async function vaultTouch(): Promise<void> {
+  return invoke<void>("vault_touch");
+}
+
 export async function vaultCreate(name: string, password: string, hint?: string): Promise<CreatedVault> {
   return invoke<CreatedVault>("vault_create", { name, password, hint: hint ?? null });
 }
@@ -59,12 +64,23 @@ export async function appSettingsSetDefault(path: string | null): Promise<AppSet
   return invoke<AppSettings>("app_settings_set_default", { path });
 }
 
-export async function vaultDeleteVault(path: string): Promise<void> {
-  return invoke<void>("vault_delete_vault", { path });
+export async function vaultDeleteVault(path: string): Promise<VaultDeleteResult> {
+  return invoke<VaultDeleteResult>("vault_delete_vault", { path });
+}
+
+export interface VaultDeleteResult {
+  /** True only when the file, backup and blobs were actually removed. */
+  filesDeleted: boolean;
+  listingRemoved: boolean;
 }
 
 export async function vaultOpen(path: string, password: string): Promise<VaultGraph> {
   return invoke<VaultGraph>("vault_open", { path, password });
+}
+
+/** Document of the session that is already unlocked in Rust (reload recovery). */
+export async function vaultGetDocument(): Promise<VaultGraph> {
+  return invoke<VaultGraph>("vault_get_document");
 }
 
 export async function vaultSave(graph: VaultGraph, retainAttachmentIds: string[] = []): Promise<void> {
@@ -75,8 +91,8 @@ export async function vaultLock(): Promise<void> {
   return invoke<void>("vault_lock");
 }
 
-export async function vaultRestoreBackup(path: string): Promise<void> {
-  return invoke<void>("vault_restore_backup", { path });
+export async function vaultRestoreBackup(path: string, password: string): Promise<void> {
+  return invoke<void>("vault_restore_backup", { path, password });
 }
 
 export async function attachmentImport(

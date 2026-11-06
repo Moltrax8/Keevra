@@ -62,6 +62,18 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
   "extraKeys",
 ]);
 
+/** Legacy graph sections that have no v3 equivalent; preserved as a snapshot. */
+const LEGACY_GRAPH_KEYS = ["nodes", "relationships", "layout", "nodeTypeDefinitions"] as const;
+
+/** A section is worth preserving only when it actually carries data. */
+function hasContent(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  const record = asRecord(value);
+  if (record !== null) return Object.keys(record).length > 0;
+  return true;
+}
+
 interface MigrationCounts {
   accounts: number;
   fields: number;
@@ -95,6 +107,28 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/** Collects keys this build does not understand, preserving them verbatim. */
+function preservedKeys(
+  source: Record<string, unknown>,
+  known: readonly string[],
+): Record<string, unknown> | undefined {
+  const kept: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (!known.includes(key)) kept[key] = value;
+  }
+  return Object.keys(kept).length > 0 ? kept : undefined;
+}
+
+/** Adds `extraKeys` only when something unknown actually exists. */
+function withPreserved<T extends object>(
+  base: T,
+  source: Record<string, unknown>,
+  known: readonly string[],
+): T & { extraKeys?: Record<string, unknown> } {
+  const extra = preservedKeys(source, known);
+  return extra === undefined ? base : { ...base, extraKeys: extra };
+}
+
 function asFields(value: unknown, counts: MigrationCounts): Field[] {
   const source = asArray(value);
   const fields = source.flatMap((entry): Field[] => {
@@ -108,7 +142,13 @@ function asFields(value: unknown, counts: MigrationCounts): Field[] {
     ) {
       return [];
     }
-    return [{ id: field.id, label: field.label, type: field.type as FieldType, value: field.value }];
+    return [
+      withPreserved(
+        { id: field.id, label: field.label, type: field.type as FieldType, value: field.value },
+        field,
+        ["id", "label", "type", "value"],
+      ),
+    ];
   });
   counts.fields += source.length - fields.length;
   return fields;
@@ -125,13 +165,23 @@ function asBlueprintFields(value: unknown, counts: MigrationCounts): PresetField
     if (field === null || typeof field.label !== "string" || typeof field.type !== "string") {
       return [];
     }
-    return [{ label: field.label, type: field.type as FieldType, value: asString(field.value) }];
+    return [
+      withPreserved(
+        { label: field.label, type: field.type as FieldType, value: asString(field.value) },
+        field,
+        ["label", "type", "value"],
+      ),
+    ];
   });
   counts.presetFields += source.length - fields.length;
   return fields;
 }
 
-function asAccount(value: unknown, counts: MigrationCounts): Account | null {
+function asAccount(
+  value: unknown,
+  counts: MigrationCounts,
+  consumedKeys: readonly string[] = [],
+): Account | null {
   const account = asRecord(value);
   if (account === null) {
     counts.accounts += 1;
@@ -142,16 +192,24 @@ function asAccount(value: unknown, counts: MigrationCounts): Account | null {
     counts.accounts += 1;
     return null;
   }
-  return {
-    id,
-    name: asString(account.name, id),
-    service: asString(account.service),
-    tags: asTags(account.tags),
-    fields: asFields(account.fields, counts),
-  };
+  return withPreserved(
+    {
+      id,
+      name: asString(account.name, id),
+      service: asString(account.service),
+      tags: asTags(account.tags),
+      fields: asFields(account.fields, counts),
+    },
+    account,
+    ["id", "name", "service", "tags", "fields", ...consumedKeys],
+  );
 }
 
-function asPreset(value: unknown, counts: MigrationCounts): AccountPreset | null {
+function asPreset(
+  value: unknown,
+  counts: MigrationCounts,
+  consumedKeys: readonly string[] = [],
+): AccountPreset | null {
   const preset = asRecord(value);
   if (preset === null) {
     counts.presets += 1;
@@ -162,13 +220,17 @@ function asPreset(value: unknown, counts: MigrationCounts): AccountPreset | null
     counts.presets += 1;
     return null;
   }
-  return {
-    id,
-    name: asString(preset.name, id),
-    service: asString(preset.service),
-    tags: asTags(preset.tags),
-    fields: asBlueprintFields(preset.fields, counts),
-  };
+  return withPreserved(
+    {
+      id,
+      name: asString(preset.name, id),
+      service: asString(preset.service),
+      tags: asTags(preset.tags),
+      fields: asBlueprintFields(preset.fields, counts),
+    },
+    preset,
+    ["id", "name", "service", "tags", "fields", ...consumedKeys],
+  );
 }
 
 /**
@@ -199,7 +261,8 @@ function accountsFromNodes(document: Record<string, unknown>, counts: MigrationC
 
   const accounts: Account[] = [];
   for (const node of nodes) {
-    const account = asAccount(node, counts);
+    // `type` is a legacy graph key consumed by the migration, not unknown data.
+    const account = asAccount(node, counts, ["type"]);
     if (account === null) continue;
     // A pure service container is migrated into its children, not dropped as
     // malformed data.
@@ -249,8 +312,9 @@ export function migrateVaultGraphReport(stored: unknown): MigrationReport {
     : accountsFromNodes(document, counts);
 
   const presetSource = Array.isArray(document.presets) ? document.presets : document.templates;
+  const presetConsumedKeys = Array.isArray(document.presets) ? [] : ["nodeType"];
   const presets = asArray(presetSource)
-    .map((entry) => asPreset(entry, counts))
+    .map((entry) => asPreset(entry, counts, presetConsumedKeys))
     .filter((preset): preset is AccountPreset => preset !== null);
 
   const attachmentSource = asArray(document.attachments);
@@ -263,9 +327,21 @@ export function migrateVaultGraphReport(stored: unknown): MigrationReport {
     counts.serviceIcons += Object.keys(iconSource).length - Object.keys(serviceIcons).length;
   }
 
-  const extraKeys: Record<string, unknown> = {};
+  // Start from keys preserved by an earlier load (they live under `extraKeys`
+  // in the saved document), then add any new unknown top-level keys.
+  const extraKeys: Record<string, unknown> = { ...(asRecord(document.extraKeys) ?? {}) };
   for (const [key, value] of Object.entries(document)) {
     if (!KNOWN_TOP_LEVEL_KEYS.has(key)) extraKeys[key] = value;
+  }
+  // The legacy graph is not converted 1:1, but it must never vanish silently:
+  // keep the original sections encrypted alongside the v3 document so a user
+  // can still recover relationship/layout data.
+  const legacyGraph: Record<string, unknown> = {};
+  for (const key of LEGACY_GRAPH_KEYS) {
+    if (hasContent(document[key])) legacyGraph[key] = document[key];
+  }
+  if (Object.keys(legacyGraph).length > 0) {
+    extraKeys.legacyGraph = { ...(asRecord(extraKeys.legacyGraph) ?? {}), ...legacyGraph };
   }
 
   const graph: VaultGraph = {
@@ -277,7 +353,13 @@ export function migrateVaultGraphReport(stored: unknown): MigrationReport {
   };
   if (Object.keys(extraKeys).length > 0) graph.extraKeys = extraKeys;
 
-  return { graph, warnings: summarizeSkipped(counts) };
+  const warnings = summarizeSkipped(counts);
+  if (Object.keys(legacyGraph).length > 0) {
+    warnings.push(
+      "Older graph data (nodes, relationships, layout) was preserved unchanged under legacyGraph and was not deleted.",
+    );
+  }
+  return { graph, warnings };
 }
 
 /** Convenience wrapper for callers that only need the migrated document. */

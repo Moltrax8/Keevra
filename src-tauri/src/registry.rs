@@ -215,6 +215,24 @@ pub fn is_registered(registry: &Path, path: &str) -> bool {
     })
 }
 
+/// True only when `path` is a `.vault` file directly inside the app-managed
+/// vault directory (after resolving links/junctions). Externally located
+/// vaults can be listed and opened, but never deleted through the app: for
+/// them only the listing may be removed.
+pub fn is_app_managed(app_data_dir: &Path, path: &str) -> bool {
+    let Ok(candidate) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(dir) = std::fs::canonicalize(vaults_dir(app_data_dir)) else {
+        return false;
+    };
+    candidate.parent() == Some(dir.as_path())
+        && candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("vault"))
+}
+
 /// Forgets a listing only; the vault file itself is never touched.
 pub fn forget_vault(registry: &Path, path: &str) -> Result<Vec<VaultEntry>, VaultError> {
     let mut entries = read_registry(registry);
@@ -278,6 +296,27 @@ mod tests {
         rename_vault(&registry, "/tmp/b.vault", "PERSONAL").expect("rename onto duplicate");
         assert!(rename_vault(&registry, "/tmp/missing.vault", "X").is_err());
         let _ = std::fs::remove_file(&registry);
+    }
+
+    #[test]
+    fn only_direct_children_of_the_vault_dir_are_app_managed() {
+        let root = std::env::temp_dir().join(format!("keevra-managed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let managed_dir = vaults_dir(&root);
+        std::fs::create_dir_all(&managed_dir).expect("vault dir");
+        let managed = managed_dir.join("abc.vault");
+        std::fs::write(&managed, b"vault").expect("managed file");
+        let outside_dir = root.join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir");
+        let outside = outside_dir.join("abc.vault");
+        std::fs::write(&outside, b"vault").expect("outside file");
+        let not_vault = managed_dir.join("notes.txt");
+        std::fs::write(&not_vault, b"text").expect("text file");
+
+        assert!(is_app_managed(&root, &managed.to_string_lossy()));
+        assert!(!is_app_managed(&root, &outside.to_string_lossy()));
+        assert!(!is_app_managed(&root, &not_vault.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

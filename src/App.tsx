@@ -25,7 +25,7 @@ import { AccountList } from "./components/AccountList";
 import { AccountDetail } from "./components/AccountDetail";
 import { useHistory, useUndoRedoShortcuts } from "./hooks/useHistory";
 import { useAccounts } from "./hooks/useAccounts";
-import { useVaultSession } from "./hooks/useVaultSession";
+import { useVaultSession, type DraftFlushResult } from "./hooks/useVaultSession";
 import { useUpdater } from "./hooks/useUpdater";
 import { useAutoLock } from "./hooks/useAutoLock";
 import "./App.css";
@@ -64,6 +64,20 @@ function App() {
     return run;
   });
 
+  // Central draft flush: every editor saves its focused draft and reports
+  // whether it changed anything, so lock/close/export never clear state before
+  // the draft is committed to the document. A rejected draft blocks the lock
+  // instead of being silently dropped.
+  const flushDrafts = useEffectEvent(async (): Promise<DraftFlushResult> => {
+    const detail: DraftFlushResult = { changed: false, failed: false };
+    window.dispatchEvent(new CustomEvent("keevra:flush-drafts", { detail }));
+    if (detail.changed) {
+      // Let React commit the flushed drafts before persist() snapshots state.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return detail;
+  });
+
   function applyVaultDocument(stored: VaultGraph) {
     accounts.applyVaultDocument(stored);
     history.reset();
@@ -78,6 +92,7 @@ function App() {
   const session = useVaultSession({
     dirty: accounts.dirty,
     persist: doPersist,
+    flushDrafts,
     applyVaultDocument,
     onLocked,
   });
@@ -103,7 +118,9 @@ function App() {
 
   // Locking flushes unsaved changes itself and refuses to lock when the flush
   // fails, so memory is never cleared before the data is safely on disk.
-  useAutoLock(vaultActive, () => void session.handleVaultLock());
+  // A refused lock keeps auto-lock armed so the session cannot stay open by
+  // accident after one failed save.
+  useAutoLock(vaultActive, () => session.handleVaultLock());
 
   // Stable view of the close handler for the window listener registered once.
   const closeVault = useEffectEvent(() => session.handleVaultClose());
@@ -129,9 +146,7 @@ function App() {
           if (closingRef.current) return;
           closingRef.current = true;
           try {
-            window.dispatchEvent(new Event("keevra:flush-drafts"));
-            // Let React apply the committed drafts before taking the snapshot.
-            await new Promise((resolve) => setTimeout(resolve, 0));
+            // handleVaultClose flushes drafts and persists before locking.
             if (await closeVault()) await appWindow.destroy();
           } finally {
             closingRef.current = false;

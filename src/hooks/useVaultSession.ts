@@ -8,6 +8,7 @@ import {
   vaultDeleteVault,
   vaultExportPackage,
   vaultForget,
+  vaultGetDocument,
   vaultImportPackage,
   vaultList,
   vaultLock,
@@ -23,11 +24,25 @@ import { UnsupportedVaultVersionError, type VaultGraph } from "../vaultDocument"
 
 export type BackendState = "checking" | "demo" | "locked" | "unlocked";
 
+export interface DraftFlushResult {
+  /** At least one editor committed a draft to the document. */
+  changed: boolean;
+  /** An editor rejected its draft (e.g. validation), so locking must wait. */
+  failed: boolean;
+}
+
 export interface VaultSessionOptions {
   dirty: boolean;
   persist: () => Promise<boolean>;
+  /** Commits any focused editor drafts, then lets React apply them. */
+  flushDrafts: () => Promise<DraftFlushResult>;
   applyVaultDocument: (stored: VaultGraph) => void;
   onLocked: () => void;
+}
+
+export interface VaultDeleteOutcome {
+  error: string | null;
+  notice: string | null;
 }
 
 export interface VaultSessionApi {
@@ -47,15 +62,16 @@ export interface VaultSessionApi {
   handleVaultOpen: (path: string, password: string) => Promise<boolean>;
   handleVaultCreate: (name: string, password: string, hint: string) => Promise<boolean>;
   handleVaultRemember: (name: string, path: string, hint: string) => Promise<boolean>;
-  handleVaultDelete: (path: string) => Promise<string | null>;
+  handleVaultDelete: (path: string) => Promise<VaultDeleteOutcome>;
   handleDefaultChange: (path: string | null) => Promise<void>;
   handleSettingsCreate: (name: string, password: string, hint: string) => Promise<string | null>;
   handleVaultForget: (path: string) => Promise<void>;
   handleVaultRename: (path: string, name: string) => Promise<string | null>;
-  handleVaultRestore: (path: string) => Promise<void>;
+  handleVaultRestore: (path: string, password: string) => Promise<void>;
   handleExportPackage: () => Promise<void>;
   handleImportPackage: () => Promise<void>;
-  handleVaultLock: () => Promise<void>;
+  /** Returns false when unsaved changes could not be written. */
+  handleVaultLock: () => Promise<boolean>;
   /** Flush and lock before closing the window; false keeps the window open. */
   handleVaultClose: () => Promise<boolean>;
 }
@@ -63,6 +79,7 @@ export interface VaultSessionApi {
 export function useVaultSession({
   dirty,
   persist,
+  flushDrafts,
   applyVaultDocument,
   onLocked,
 }: VaultSessionOptions): VaultSessionApi {
@@ -97,7 +114,23 @@ export function useVaultSession({
           setVaultPath(entries[0]?.path ?? "");
           setVaultName(entries[0]?.name ?? "");
         }
-        setBackend(status.unlocked ? "unlocked" : "locked");
+        if (!status.unlocked) {
+          setBackend("locked");
+          return;
+        }
+        // Rust still holds an unlocked session (renderer reload). Never show
+        // the initial demo document over it: load the real document, or fail
+        // closed and lock.
+        try {
+          applyVaultDocument(await vaultGetDocument());
+          if (cancelled) return;
+          setBackend("unlocked");
+        } catch {
+          await vaultLock().catch(() => {});
+          if (cancelled) return;
+          setLockError("The open vault could not be reloaded. Enter your password to continue.");
+          setBackend("locked");
+        }
       } catch {
         if (!cancelled) setBackend("demo");
       }
@@ -113,6 +146,24 @@ export function useVaultSession({
     return entries;
   }
 
+  /**
+   * Commits focused drafts first, then saves if anything actually changed.
+   * Auto-lock, lock, export, import and vault switching all go through this so
+   * an in-progress field edit can never be dropped by a state clear.
+   */
+  async function ensureSaved(): Promise<boolean> {
+    const { changed, failed } = await flushDrafts();
+    if (failed) return false;
+    if (!dirty && !changed) return true;
+    return persist();
+  }
+
+  /** True only when the backend authoritatively reports no open session. */
+  async function backendLocked(): Promise<boolean> {
+    const status = await vaultStatus().catch(() => null);
+    return status !== null && !status.unlocked;
+  }
+
   async function handleVaultOpen(path: string, password: string): Promise<boolean> {
     if (password === "") {
       setLockError("Enter a password.");
@@ -121,18 +172,28 @@ export function useVaultSession({
     setLockBusy(true);
     setLockError(null);
     setLockNotice(null);
+    let sessionOpened = false;
     try {
-      applyVaultDocument(await vaultOpen(path, password));
+      const graph = await vaultOpen(path, password);
+      sessionOpened = true;
+      // A document this build cannot parse must not leave an unlocked Rust
+      // session behind while the UI shows the lock screen.
+      applyVaultDocument(graph);
       setVaultPath(path);
       const entries = await refreshVaults();
       setVaultName(entries.find((item) => item.path === path)?.name ?? "");
       setBackend("unlocked");
       return true;
     } catch (error) {
+      if (sessionOpened) {
+        await vaultLock().catch(() => {});
+      }
       setLockError(
         error instanceof UnsupportedVaultVersionError
           ? `This vault was created by a newer version of ${APP_NAME} (schema ${error.version}). Update the app to open it.`
-          : "Could not open the vault (wrong password or corrupt file).",
+          : sessionOpened
+            ? "The vault opened but its contents could not be read. It was locked again."
+            : "Could not open the vault (wrong password or corrupt file).",
       );
       return false;
     } finally {
@@ -178,17 +239,35 @@ export function useVaultSession({
     }
   }
 
-  async function handleVaultDelete(path: string): Promise<string | null> {
+  async function handleVaultDelete(path: string): Promise<VaultDeleteOutcome> {
     setLockBusy(true);
     try {
-      await vaultDeleteVault(path);
+      const result = await vaultDeleteVault(path);
       const entries = await refreshVaults();
       if (vaultPath === path) setVaultPath(entries[0]?.path ?? "");
       const settings = await appSettingsGet().catch(() => null);
       if (settings) setDefaultVaultPath(settings.defaultVaultPath);
-      return null;
-    } catch {
-      return "Could not delete the vault file.";
+      return {
+        error: null,
+        notice: result.filesDeleted
+          ? null
+          : "Removed from the list. The vault file was left on disk because it is not managed by this app.",
+      };
+    } catch (error) {
+      const message = typeof error === "string" ? error : "";
+      if (message.includes("vault_unlocked")) {
+        return { error: "Lock the vault before deleting it.", notice: null };
+      }
+      if (message.includes("not_a_vault")) {
+        return { error: "That file is not a Keevra vault. Nothing was deleted.", notice: null };
+      }
+      if (message.includes("delete_failed")) {
+        return {
+          error: "The vault could not be fully deleted. Its listing was kept; check file permissions and try again.",
+          notice: null,
+        };
+      }
+      return { error: "Could not delete the vault.", notice: null };
     } finally {
       setLockBusy(false);
     }
@@ -204,7 +283,7 @@ export function useVaultSession({
   }
 
   async function handleSettingsCreate(name: string, password: string, hint: string): Promise<string | null> {
-    if (dirty && !(await persist())) {
+    if (!(await ensureSaved())) {
       return "Could not save the current vault. New vault was not created.";
     }
     setLockBusy(true);
@@ -251,15 +330,30 @@ export function useVaultSession({
     }
   }
 
-  async function handleVaultRestore(path: string) {
+  async function handleVaultRestore(path: string, password: string) {
+    if (password === "") {
+      setLockError("Enter the vault password to verify the backup.");
+      return;
+    }
     setLockBusy(true);
     setLockError(null);
     setLockNotice(null);
     try {
-      await vaultRestoreBackup(path);
-      setLockNotice("Backup restored. Open the vault with your password.");
-    } catch {
-      setLockError("No backup found for that path.");
+      await vaultRestoreBackup(path, password);
+      setLockNotice(
+        "Backup verified with your password and restored. The previous vault is kept as a .pre-restore copy. Open the vault again.",
+      );
+    } catch (error) {
+      const message = typeof error === "string" ? error : "";
+      if (message.includes("vault_unlocked")) {
+        setLockError("Lock the vault before restoring a backup.");
+      } else if (message.includes("wrong_password_or_corrupt")) {
+        setLockError("The backup is corrupt or the password does not match it. Nothing was changed.");
+      } else if (message.includes("vault_not_found")) {
+        setLockError("No backup found for that vault.");
+      } else {
+        setLockError("Could not restore the backup. The vault was not changed.");
+      }
     } finally {
       setLockBusy(false);
     }
@@ -267,7 +361,7 @@ export function useVaultSession({
 
   async function handleExportPackage() {
     setPackageMessage(null);
-    if (dirty && !(await persist())) {
+    if (!(await ensureSaved())) {
       setPackageMessage("Could not save the vault before export. Nothing was exported.");
       return;
     }
@@ -281,7 +375,9 @@ export function useVaultSession({
     if (!dest) return;
     try {
       const count = await vaultExportPackage(dest);
-      setPackageMessage(`Exported encrypted package with ${count} attachment(s). Nothing was decrypted.`);
+      setPackageMessage(
+        `Exported encrypted package with ${count} attachment(s). Attachment integrity was verified; no plaintext left the app.`,
+      );
     } catch {
       setPackageMessage("Package export failed.");
     }
@@ -299,7 +395,7 @@ export function useVaultSession({
     if (!source) return;
     const stem = source.split(/[/\\]/).pop()?.replace(/\.vtpkg\.json$/i, "").trim() ?? "";
     const name = stem === "" ? "Imported vault" : stem;
-    if (dirty && !(await persist())) {
+    if (!(await ensureSaved())) {
       setPackageMessage("Could not save the current vault before import. Nothing was imported.");
       return;
     }
@@ -312,25 +408,43 @@ export function useVaultSession({
     }
   }
 
-  async function handleVaultLock() {
-    if (dirty && !(await persist())) {
+  async function handleVaultLock(): Promise<boolean> {
+    if (!(await ensureSaved())) {
+      // A backend idle timeout may have closed the session while the renderer
+      // was suspended. Never show "unlocked" when the key is already gone.
+      if (await backendLocked()) {
+        setLockError(null);
+        onLocked();
+        setBackend("locked");
+        return true;
+      }
       // Never drop decrypted state while unsaved changes could not be written.
       setLockError("Could not save your changes. The vault stays unlocked so nothing is lost.");
-      return;
+      return false;
     }
     try {
       await vaultLock();
     } catch {
-      // Session state is best-effort here; always clear the UI below.
+      // Do not clear the UI if Rust still holds the key: that would fake a
+      // locked state while decrypted data stays in memory.
+      setLockError("Could not lock the vault. Restart the app to clear the session.");
+      return false;
     }
     setLockError(null);
     onLocked();
     setBackend("locked");
+    return true;
   }
 
   async function handleVaultClose(): Promise<boolean> {
     // Always flush: the close handler first commits any in-progress drafts.
-    if (!(await persist())) {
+    if (!(await ensureSaved())) {
+      if (await backendLocked()) {
+        setLockError(null);
+        onLocked();
+        setBackend("locked");
+        return true;
+      }
       setLockError("Could not save your changes. The window stays open so nothing is lost.");
       return false;
     }

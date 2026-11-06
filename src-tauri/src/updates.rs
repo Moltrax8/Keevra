@@ -136,18 +136,30 @@ pub async fn download_verified(
         return Err(VaultError::Io("invalid_update_sha".to_string()));
     }
     let parsed = validate_update_url(url)?;
-    let response = reqwest::get(parsed)
+    let mut response = reqwest::get(parsed)
         .await
         .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
     if !response.status().is_success() {
         return Err(VaultError::Io("update_download_failed".to_string()));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
-    if bytes.len() as u64 > MAX_UPDATE_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPDATE_BYTES)
+    {
         return Err(VaultError::Io("update_too_large".to_string()));
+    }
+    // Stream with a running byte counter: a hostile/chunked response can never
+    // force the whole body into memory before the cap is applied (K-10).
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?
+    {
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_UPDATE_BYTES {
+            return Err(VaultError::Io("update_too_large".to_string()));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     let digest = Sha256::digest(&bytes);
     let actual = format!("{digest:x}");
