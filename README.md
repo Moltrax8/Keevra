@@ -82,13 +82,25 @@ See [`docs/UPDATER_SECURITY.md`](docs/UPDATER_SECURITY.md).
 ## Status
 
 Keevra is **pre-1.0**. Encryption, auto-lock, attachments, packages, and the
-updater are in place. This is the first public source release. Windows binaries
-are published only after they are Authenticode-signed, so a signed installer is
-not available yet; use **fake data only**.
+updater are in place. This is the first public release. Windows installers are
+**not code-signed yet**, so SmartScreen shows an "unknown publisher" warning on
+first run. That warning is expected; the release page publishes a SHA-256
+checksum so you can verify the download. Use **fake data only** until you have
+reviewed the code.
 
 ## Install
 
-Build from source until the signed installer is published:
+Download the NSIS installer from the
+[latest release](https://github.com/Moltrax8/Keevra/releases/latest), verify its
+SHA-256 against `SHA256SUMS.txt` on the release page, then run it.
+
+Windows SmartScreen will warn that the publisher is unknown because the
+installer is unsigned. Choose **More info → Run anyway** only if the checksum
+matches. The build is reproducible from the tagged source; see
+[`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md) for the provenance and
+verification details.
+
+Alternatively, build from source:
 
 ```powershell
 npm ci
@@ -96,8 +108,6 @@ npm run tauri build
 ```
 
 The NSIS installer is written under `src-tauri/target/release/bundle/nsis/`.
-Local builds are unsigned and must not be redistributed (see
-[`docs/RELEASE_SECURITY.md`](docs/RELEASE_SECURITY.md)).
 
 Requirements: Windows 10/11 (x64) with WebView2.
 

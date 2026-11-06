@@ -44,6 +44,9 @@ Keevra is pre-1.0 and does not use Semantic Versioning yet.
   blur; there is no per-field Save button.
 - **Brand wordmarks.** The README uses horizontal dark/light serif wordmarks in
   the app's persimmon palette; the in-app mark ships from `src/assets/`.
+- **Unsigned installers.** Windows builds are published without Authenticode;
+  SmartScreen warns about an unknown publisher. Each release ships
+  `SHA256SUMS.txt` and provenance attestations so the download can be verified.
 
 ### Fixed
 

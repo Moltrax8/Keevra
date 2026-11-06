@@ -49,12 +49,12 @@ This document is the authority for the update channel alongside
 
 1. Build the installer from the release tag with locked dependencies
    (`npm ci`, `cargo build --locked`). Pushing a `v<version>` tag runs
-   `.github/workflows/release.yml`, which refuses to build unless the
-   Authenticode certificate is configured (see `docs/RELEASE_SECURITY.md`).
-   The workflow creates a **draft** release containing the signed installer,
-   SBOMs and provenance attestations.
+   `.github/workflows/release.yml`, which builds the NSIS installer, signs and
+   verifies it when a certificate is configured, and attaches
+   `SHA256SUMS.txt`, SBOMs and provenance attestations. See
+   `docs/RELEASE_SECURITY.md`.
 2. Compute SHA256 of `*-setup.exe`; write `updates.json`:
-   `{"version":"0.3.0","assets":[{"name":"<exe>","sha256":"<hex>"}]}`
+   `{"version":"0.1.0","assets":[{"name":"<exe>","sha256":"<hex>"}]}`
    (`version` must equal the release tag modulo leading `v`).
 3. On the OFFLINE key machine:
    `cargo run --manifest-path tools/update-tool/Cargo.toml -- sign updates.json --key <offline.key>` → `updates.json.minisig`.
@@ -82,9 +82,10 @@ This document is the authority for the update channel alongside
 - Today's gate is **signature + version + host + hash**. CI now runs
   `npm audit` and the RustSec audit, and publishes CycloneDX SBOMs for both
   dependency graphs (see `docs/RELEASE_SECURITY.md`).
-- Installers are **not Authenticode-signed yet**; that requires a certificate
-  supplied by the project owner. Until then a release must not claim a signed
-  publisher identity, and SmartScreen will warn on first install.
+- Installers are published **unsigned**; SmartScreen warns on first install.
+  The release publishes SHA-256 checksums and build-provenance attestations so
+  users can verify the download. A release must never claim a signed publisher
+  identity unless `signtool verify /pa` actually passed.
 - Full provenance (SLSA attestations / reproducible builds) is out of scope
   for this pre-1.0 build. The design accepts it without changing the client
   flow.

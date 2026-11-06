@@ -13,20 +13,45 @@ in `docs/UPDATER_SECURITY.md`.
 | `cargo audit` against the RustSec advisory database | Enforced in CI (`supply-chain` job) and in the release job |
 | CycloneDX SBOM for npm and Rust dependencies | Produced per CI run and per release |
 | Weekly dependency and action updates | `.github/dependabot.yml` |
-| Authenticode signature on the installer and executable | **Hard release gate** in `.github/workflows/release.yml`; without the certificate secrets only source archives and SBOMs are published, never an unsigned binary |
+| Authenticode signature on the installer and executable | **Not used.** Installers are published unsigned; SmartScreen warns "unknown publisher" |
+| SHA-256 checksums for published artifacts | `SHA256SUMS.txt` attached to every release |
 | Build provenance / SBOM attestations | Generated per release with `actions/attest-build-provenance` and `actions/attest` |
 | Reproducible builds | Not implemented (tracked as a future improvement) |
 
-## Code signing is a hard release gate
+## Unsigned release policy
 
-`.github/workflows/release.yml` runs on `v*.*.*` tags. A tag never publishes
-an unsigned binary: when either secret below is missing, the workflow skips the
-installer build with a warning and publishes a **source-only** release (GitHub
-source archives plus SBOMs). There is deliberately **no unsigned binary path**.
-After the secrets are added, re-run the workflow to attach the signed installer
-to the same release.
+The project does not use a paid code-signing certificate. Installers are built
+from the tagged source in CI and published **unsigned**. This is a deliberate,
+documented trade-off:
 
-Required repository secrets:
+- Windows SmartScreen shows an "unknown publisher" warning on first run. The
+  user must choose **More info → Run anyway**.
+- There is no publisher identity in the binary. Trust comes from the published
+  SHA-256 checksums, the GitHub build-provenance attestation, and the fact that
+  the installer can be rebuilt from the tagged source.
+- The app's own cryptography is unaffected: the vault, attachments and update
+  manifest verification do not depend on Authenticode.
+
+Users who do not want the SmartScreen warning can build from source with
+`npm ci && npm run tauri build`.
+
+### Verifying a download
+
+```powershell
+# 1. Hash matches the release's SHA256SUMS.txt
+Get-FileHash .\Keevra_<version>_x64-setup.exe -Algorithm SHA256
+
+# 2. The file was built by this repository's release workflow
+gh attestation verify .\Keevra_<version>_x64-setup.exe --repo Moltrax8/Keevra
+```
+
+Do not install a download whose hash or attestation does not match.
+
+### If a certificate becomes available
+
+The workflow already supports Authenticode. Add these repository secrets and
+re-run the release; the same job signs and verifies both binaries before
+uploading:
 
 1. `WINDOWS_CERT_BASE64` — the OV/EV Windows code-signing certificate exported
    as `.pfx` and base64-encoded. Keep the source `.pfx` and its password in a
@@ -47,19 +72,9 @@ signtool verify /pa /v src-tauri\target\release\bundle\nsis\Keevra_<version>_x64
 ```
 
 A verification failure aborts the job. The imported certificate is removed in
-an `always()` step.
-
-Local development builds made with `npm run tauri build` are still unsigned.
-They must never be distributed; only the signed release artifacts may be
-published.
-
-### EV certificate / cloud HSM
-
-EV certificates often cannot be exported as a `.pfx`. For those, replace the
-`--config` signing block with Tauri's `signCommand` (or a cloud signing
-provider's CLI) and keep the same gate: the release job must fail unless the
-signature verifies. The rest of the pipeline (SBOM, attestation, draft
-release) is unchanged.
+an `always()` step. For an EV certificate that cannot be exported as a `.pfx`,
+replace the `--config` block with Tauri's `signCommand` (or a cloud signing
+provider's CLI) and keep the same verification gate.
 
 ## SBOMs and provenance
 
@@ -86,22 +101,23 @@ needs to be matched against shipped versions.
 2. Bump the version in `package.json`, `src-tauri/Cargo.toml` and
    `src-tauri/tauri.conf.json`, then push a `v<version>` tag. The release job
    aborts if the tag and the three version files disagree.
-3. If the code-signing secrets are configured, confirm the workflow verified
-   the Authenticode signature on both the app executable and the installer.
-   If they are not, the tag produces a source-only release; add the secrets and
-   re-run the workflow before announcing a downloadable build.
-4. Download `updates.unsigned.json` from the draft release, sign it **offline**
-   with the updater key, and upload `updates.json` + `updates.json.minisig`.
-   Never publish `updates.unsigned.json` as the manifest.
-5. Verify the draft release contains the signed installer, both SBOMs and the
-   attestations; then publish.
+3. Confirm the release contains the installer, `SHA256SUMS.txt`, both SBOMs and
+   the attestations. The installer is unsigned unless the certificate secrets
+   are configured; note the SmartScreen warning in the release notes.
+4. If you ship an updater-enabled binary, download `updates.unsigned.json`,
+   sign it **offline** with the updater key, and upload `updates.json` +
+   `updates.json.minisig`. Never publish `updates.unsigned.json` as the
+   manifest.
+5. Verify the install on a clean Windows machine and check the SHA-256 matches.
 6. Run the tamper drill from `docs/UPDATER_SECURITY.md` before announcing.
 
 ## Threat model limits
 
-- A compromised GitHub account can still publish a *new* signed release if it
-  also obtains the offline updater key. Authenticode reduces first-install
-  impersonation but does not fix key custody.
-- A compromised developer or CI runner can inject code before signing. Build
+- **Unsigned installers can be impersonated.** An attacker can rebuild or
+  modify a release and host it elsewhere. The defense is the published SHA-256
+  checksum and the provenance attestation; users must actually verify them.
+- A compromised GitHub account can publish a malicious release. Provenance
+  makes the origin auditable, but it does not prove the code is benign.
+- A compromised developer or CI runner can inject code before packaging. Build
   provenance makes the origin auditable; reproducible builds are the stronger
   mitigation and are not implemented yet.
