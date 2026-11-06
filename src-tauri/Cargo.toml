@@ -18,7 +18,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 argon2 = "0.5"
 base64 = "0.22"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 mime_guess = "2.0"
 rand = "0.8"
