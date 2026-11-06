@@ -149,7 +149,7 @@ jobs:
           subject-path: release-artifacts/*
           sbom-path: release-artifacts/keevra-rust-sbom.cdx.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: keevra-release-${{ github.ref_name }}
           path: release-artifacts/*
