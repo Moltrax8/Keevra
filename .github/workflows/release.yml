@@ -1,0 +1,266 @@
+name: Release
+
+# Tag-only, fail-closed release pipeline (K-15).
+#
+# A tag never publishes an unsigned binary. When the Windows code-signing
+# secrets are present, the job builds, Authenticode-signs and verifies the
+# installer before attaching it to the release. When they are absent, the tag
+# publishes a source-only release (GitHub source archives + SBOMs) and the
+# signed build is skipped with a warning. Re-run the workflow after adding the
+# secrets to attach the signed installer.
+#
+# The update manifest is signed OFFLINE with the updater key and attached
+# manually (see docs/RELEASE_SECURITY.md).
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      signing: ${{ steps.check.outputs.signing }}
+    steps:
+      - name: Check code-signing secrets
+        id: check
+        env:
+          CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if [ -n "$CERT_BASE64" ] && [ -n "$CERT_PASSWORD" ]; then
+            echo "signing=true" >> "$GITHUB_OUTPUT"
+            echo "Code-signing secrets are configured; a signed installer will be built."
+          else
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Unsigned build skipped::WINDOWS_CERT_BASE64 / WINDOWS_CERT_PASSWORD are not configured, so no binary is produced. This tag publishes source archives and SBOMs only. Add both secrets, then re-run this workflow to attach the signed installer."
+          fi
+
+  signed-release:
+    needs: preflight
+    if: needs.preflight.outputs.signing == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write      # release upload
+      id-token: write      # build provenance attestation
+      attestations: write  # Sigstore-backed attestations
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches every version file
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG.TrimStart("v")
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargo = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          foreach ($pair in @(@("package.json", $pkg), @("Cargo.toml", $cargo), @("tauri.conf.json", $conf))) {
+            if ($pair[1] -ne $tag) { throw "Tag $tag does not match $($pair[0]) version $($pair[1])" }
+          }
+
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      # Audit the exact locked graph of the tagged commit. CI runs this on
+      # main, but a tag can point at an unmerged commit, so the gate is
+      # repeated here rather than inherited.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Rust advisory audit
+        run: cargo audit --file src-tauri/Cargo.lock
+
+      # Import the PFX into the runner's certificate store and give Tauri a
+      # signing config. Missing secrets are handled by the preflight job.
+      - name: Import code-signing certificate
+        shell: pwsh
+        env:
+          CERT_BASE64: ${{ secrets.WINDOWS_CERT_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERT_BASE64)) {
+            throw "WINDOWS_CERT_BASE64 is not configured. Refusing to produce an unsigned release."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:CERT_PASSWORD)) {
+            throw "WINDOWS_CERT_PASSWORD is not configured. Refusing to produce an unsigned release."
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "keevra-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_BASE64))
+          $secure = ConvertTo-SecureString $env:CERT_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $secure
+          Remove-Item $pfx -Force
+          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $config = @{ bundle = @{ windows = @{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://timestamp.digicert.com"
+          } } } | ConvertTo-Json -Depth 5
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP "keevra-signing.json") -Value $config -Encoding utf8
+
+      - name: Build signed NSIS installer
+        shell: pwsh
+        run: npx tauri build --bundles nsis --config "$env:RUNNER_TEMP\keevra-signing.json"
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          $targets = @(Get-ChildItem "src-tauri\target\release\bundle\nsis\*-setup.exe")
+          $targets += Get-Item "src-tauri\target\release\keevra.exe"
+          foreach ($target in $targets) {
+            & $signtool.FullName verify /pa /v $target.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed for $($target.FullName)" }
+          }
+
+      - name: Collect release artifacts and SHA256
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-artifacts | Out-Null
+          $installer = Get-ChildItem "src-tauri\target\release\bundle\nsis\*-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer not found" }
+          Copy-Item $installer.FullName release-artifacts
+          Copy-Item "src-tauri\target\release\keevra.exe" release-artifacts
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $sha = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLower()
+          # Unsigned manifest input: the updater key lives offline, so the
+          # maintainer signs this file out-of-band and uploads updates.json +
+          # updates.json.minisig. Never publish this file as updates.json.
+          $manifest = @{ version = $version; assets = @(@{ name = $installer.Name; sha256 = $sha }) } |
+            ConvertTo-Json -Depth 5
+          Set-Content -Path "release-artifacts\updates.unsigned.json" -Value $manifest -Encoding utf8
+
+      - name: npm SBOM (CycloneDX)
+        run: npm sbom --sbom-format=cyclonedx > release-artifacts/keevra-npm-sbom.cdx.json
+
+      - name: Rust SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: src-tauri
+          format: cyclonedx-json
+          output-file: release-artifacts/keevra-rust-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release-artifacts/*
+
+      - name: Attest SBOM
+        uses: actions/attest@v4
+        with:
+          subject-path: release-artifacts/*
+          sbom-path: release-artifacts/keevra-rust-sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keevra-release-${{ github.ref_name }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+      # Draft only: the signed update manifest must be attached manually
+      # before the release is published.
+      - name: Create or update draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $exists = gh release view $env:GITHUB_REF_NAME 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:GITHUB_REF_NAME --draft --title "Keevra $env:GITHUB_REF_NAME" `
+              --notes "Draft. Before publishing: attach the offline-signed updates.json and updates.json.minisig, then verify the Authenticode signature and provenance attestation."
+          }
+          gh release upload $env:GITHUB_REF_NAME release-artifacts/* --clobber
+
+      - name: Remove imported certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERT_THUMBPRINT) {
+            Get-ChildItem "Cert:\CurrentUser\My\$env:WINDOWS_CERT_THUMBPRINT" -ErrorAction SilentlyContinue |
+              Remove-Item -Force
+          }
+
+  # No-signing fallback: publish source archives and SBOMs, never a binary.
+  source-release:
+    needs: preflight
+    if: needs.preflight.outputs.signing != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Check tag matches every version file
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tag="${TAG#v}"
+          pkg=$(node -p "require('./package.json').version")
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          cargo=$(grep -m1 '^version = ' src-tauri/Cargo.toml | sed -E 's/^version = "([^"]+)"$/\1/')
+          [ "$tag" = "$pkg" ] || { echo "Tag $tag does not match package.json $pkg"; exit 1; }
+          [ "$tag" = "$conf" ] || { echo "Tag $tag does not match tauri.conf.json $conf"; exit 1; }
+          [ "$tag" = "$cargo" ] || { echo "Tag $tag does not match Cargo.toml $cargo"; exit 1; }
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+
+      - name: npm SBOM (CycloneDX)
+        run: npm sbom --sbom-format=cyclonedx > keevra-npm-sbom.cdx.json
+
+      - name: Rust SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: src-tauri
+          format: cyclonedx-json
+          output-file: keevra-rust-sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Create source-only release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it unchanged."
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Keevra $TAG" \
+            --notes "Source release. No Windows binary is attached: Keevra publishes installers only after Authenticode signing, and the signing certificate is not configured for this repository yet. Build from source with \`npm ci && npm run tauri build\`; local builds are unsigned and must not be redistributed. Signing policy: docs/RELEASE_SECURITY.md." \
+            keevra-npm-sbom.cdx.json keevra-rust-sbom.cdx.json

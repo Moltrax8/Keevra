@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm test
+      - run: npm run build
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --locked
+
+  # Dependency advisories and machine-readable inventories (K-15). Runs on
+  # Linux so SBOM generation and the advisory tooling stay fast and headless.
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # RustSec advisory database. Fails the build on a known vulnerability in
+      # the locked Cargo graph.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Rust advisory audit
+        run: cargo audit --file src-tauri/Cargo.lock
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - name: npm SBOM (CycloneDX)
+        run: npm sbom --sbom-format=cyclonedx > keevra-npm-sbom.cdx.json
+
+      - name: Rust SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: src-tauri
+          format: cyclonedx-json
+          artifact-name: keevra-rust-sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keevra-npm-sbom
+          path: keevra-npm-sbom.cdx.json
+          if-no-files-found: error

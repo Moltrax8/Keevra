@@ -1,0 +1,35 @@
+# Keeps toolchain and library dependencies patched with minimal delay.
+# Security fixes are grouped so a weekly PR can ship them together.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      npm-minor:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: "/src-tauri"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      cargo-minor:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
