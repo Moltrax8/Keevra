@@ -12,6 +12,13 @@ and packages remain compatible.
 
 ### Security
 
+- **Signed update manifest (0.2.2 re-issue).** This build trusts a new offline
+  ed25519 update-signing key (key 1) and the release ships `updates.json` +
+  `updates.json.minisig`, so the in-app download path is enabled with signature
+  and SHA-256 verification. The installer itself remains unsigned for
+  Authenticode, so SmartScreen still warns. Users already on the earlier 0.2.2
+  build should install this build once manually; the version number is
+  unchanged, so it will not appear as an automatic update.
 - **Delete retries finish cleanup after a partial failure (K-01).** A managed
   vault's identity is now derived from the resolved parent directory plus the
   file name instead of requiring the live file to exist. A retry after the live

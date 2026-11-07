@@ -105,9 +105,11 @@ needs to be matched against shipped versions.
    the attestations. The installer is unsigned unless the certificate secrets
    are configured; note the SmartScreen warning in the release notes.
 4. If you ship an updater-enabled binary, download `updates.unsigned.json`,
-   sign it **offline** with the updater key, and upload `updates.json` +
+   sign it **offline** with the active updater key (key 1 in
+   `src-tauri/src/update_keys.rs`), and upload `updates.json` +
    `updates.json.minisig`. Never publish `updates.unsigned.json` as the
-   manifest.
+   manifest. The private key and its backup stay outside the repository and
+   CI.
 5. Verify the install on a clean Windows machine and check the SHA-256 matches.
 6. Run the tamper drill from `docs/UPDATER_SECURITY.md` before announcing.
 

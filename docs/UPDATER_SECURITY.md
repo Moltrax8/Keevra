@@ -37,13 +37,20 @@ This document is the authority for the update channel alongside
   **offline** with the release manager; they never enter git, CI, or Supabase.
 - Key 0 (`qIa4woC9NAQ0…`, full value in `update_keys.rs`): generated
   2026-10-05 via `cargo run --manifest-path tools/update-tool/Cargo.toml -- gen-key`
-  on the release manager machine.
+  on the release manager machine. Retained so any artifact already signed with
+  it still verifies; it is not used for new releases.
+- Key 1 (`w0xD17RKn3m…`, full value in `update_keys.rs`): generated 2026-11-07
+  with the same tool. This is the **active** signing key for releases from the
+  0.2.2 re-issue onward. Its private half never enters git or CI.
 - Rotation: append the new public key to `UPDATE_SIGNING_KEYS` (verify
   accepts any listed key), publish one release signed by **both** keys
   (two `.minisig` assets or dual-sign window per release notes), then remove
   the old key in the following release. Emergency revocation = release
   removing the compromised key + rotating the GitHub token + publishing a
   `REVOKED` note users can verify out-of-band.
+- A build only trusts the keys baked into it. If a new key is introduced and
+  the previous private key is unavailable, users on older builds must install
+  the new build once manually; later releases update normally.
 
 ## Release process (maintainer)
 
