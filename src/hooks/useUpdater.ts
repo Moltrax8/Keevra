@@ -10,38 +10,43 @@ import {
   UPDATE_API_LATEST,
   type GitHubRelease,
 } from "../updates";
-import type { UpdateCheck } from "../components/UpdateBanner";
+import type { UpdateCheck } from "../components/UpdateDialog";
 
-export interface UpdaterOptions {
-  openSettings: () => void;
-  setMessage: (message: string | null) => void;
-}
+/** Used only when `getVersion()` is unavailable (browser preview). */
+const FALLBACK_VERSION = "0.0.0";
 
 export interface UpdaterApi {
   updateCheck: UpdateCheck;
   updateDismissedTag: string | null;
+  updateBusy: boolean;
   dismissUpdate: () => void;
   checkForUpdates: (manual: boolean) => Promise<void>;
   handleUpdateDownload: () => Promise<void>;
-  handleUpdateNotes: () => void;
+  copyReleaseLink: () => Promise<void>;
 }
 
-export function useUpdater({ openSettings, setMessage }: UpdaterOptions): UpdaterApi {
+export function useUpdater(): UpdaterApi {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck>({
     phase: "idle",
-    current: "0.3.0",
+    current: FALLBACK_VERSION,
     release: null,
     message: null,
   });
   const [updateDismissedTag, setUpdateDismissedTag] = useState<string | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
 
   async function currentAppVersion(): Promise<string> {
     try {
       const mod = await import("@tauri-apps/api/app");
       return await mod.getVersion();
     } catch {
-      return updateCheck.current;
+      return FALLBACK_VERSION;
     }
+  }
+
+  /** Progress/result text shown in both the dialog and the settings section. */
+  function setStatus(message: string | null) {
+    setUpdateCheck((current) => ({ ...current, message }));
   }
 
   /** Notify-only check: fetches latest GitHub release, never downloads. */
@@ -64,116 +69,133 @@ export function useUpdater({ openSettings, setMessage }: UpdaterOptions): Update
         });
       }
     } catch {
+      // Automatic checks stay silent when offline. A manual check reports it.
       if (manual) {
         setUpdateCheck((current) => ({ ...current, phase: "error", message: "Update check failed (offline?)." }));
-      } else {
-        setUpdateCheck((current) => (current.phase === "idle" ? { ...current, phase: "idle" } : current));
       }
     }
   }
 
-  /** User-consented download gated on a signed manifest. Never auto-runs. */
-  async function handleUpdateDownload() {
+  /**
+   * User-consented download gated on a signed manifest. Never auto-runs and
+   * never opens Settings: progress and verification results stay in the
+   * update dialog that asked for consent.
+   */
+  async function handleUpdateDownload(): Promise<void> {
     const release = updateCheck.release;
-    if (!release) return;
+    if (!release || updateBusy) return;
+
     const installer = pickInstallerAsset(release);
     if (!installer) {
-      setMessage("No Windows installer on this release. See the release page.");
-      openSettings();
+      setStatus("No Windows installer on this release. Use “Copy release link” to review it.");
       return;
     }
     // Unsigned releases (pre-signing): no download — manual review only.
-    // This is the secure default going forward.
     const pair = manifestAssets(release);
     if (!pair) {
-      setMessage(
-        "This release has no signed manifest (updates.json + .minisig) — download is disabled. Open the release page and verify manually.",
+      setStatus(
+        "This release has no signed manifest (updates.json + .minisig), so download is disabled. Use “Copy release link” and verify manually.",
       );
-      openSettings();
       return;
     }
-    const current = await currentAppVersion();
-    if (isMajorBump(current, release.tag_name)) {
-      const ok = window.confirm(
-        `Major version change (${current} → ${release.tag_name}). Review the release notes first. Download anyway?`,
-      );
-      if (!ok) {
-        setMessage("Major-version download cancelled — nothing was fetched.");
+
+    setUpdateBusy(true);
+    try {
+      const current = await currentAppVersion();
+      if (isMajorBump(current, release.tag_name)) {
+        const ok = window.confirm(
+          `Major version change (${current} → ${release.tag_name}). Review the release notes first. Download anyway?`,
+        );
+        if (!ok) {
+          setStatus("Major-version download cancelled — nothing was fetched.");
+          return;
+        }
+      }
+
+      setStatus("Fetching + verifying signed manifest…");
+      let manifestJson = "";
+      let manifestSig = "";
+      try {
+        const [manifestResponse, sigResponse] = await Promise.all([fetch(pair.manifestUrl), fetch(pair.sigUrl)]);
+        if (!manifestResponse.ok || !sigResponse.ok) throw new Error("manifest_fetch");
+        manifestJson = await manifestResponse.text();
+        manifestSig = await sigResponse.text();
+      } catch {
+        setStatus("Could not fetch the signed manifest. Not downloading.");
         return;
       }
-    }
-    setMessage("Fetching + verifying signed manifest…");
-    openSettings();
-    let manifestJson = "";
-    let manifestSig = "";
-    try {
-      const [manifestResponse, sigResponse] = await Promise.all([fetch(pair.manifestUrl), fetch(pair.sigUrl)]);
-      if (!manifestResponse.ok || !sigResponse.ok) throw new Error("manifest_fetch");
-      manifestJson = await manifestResponse.text();
-      manifestSig = await sigResponse.text();
-    } catch {
-      setMessage("Could not fetch the signed manifest. Not downloading.");
-      return;
-    }
-    try {
-      const verified = await updateVerifyManifest(manifestJson, manifestSig);
-      if (compareVersionTags(verified.version, release.tag_name) !== 0) {
-        setMessage("Manifest version does not match the release tag. Treated as untrusted — not downloading.");
+
+      try {
+        const verified = await updateVerifyManifest(manifestJson, manifestSig);
+        if (compareVersionTags(verified.version, release.tag_name) !== 0) {
+          setStatus("Manifest version does not match the release tag. Treated as untrusted — not downloading.");
+          return;
+        }
+      } catch {
+        setStatus("Manifest SIGNATURE INVALID — treated as untrusted. Not downloading.");
         return;
       }
-    } catch {
-      setMessage("Manifest SIGNATURE INVALID — treated as untrusted. Not downloading.");
-      return;
-    }
-    // Legacy sidecar is informational only — authority is the signed manifest.
-    let dest: string | null = null;
-    try {
-      dest = await pickExportFile(installer.name);
-    } catch {
-      setMessage("File picker failed.");
-      return;
-    }
-    if (!dest) {
-      setMessage("Download cancelled — nothing was fetched.");
-      return;
-    }
-    setMessage(`Downloading ${installer.name}… (manifest SHA check after download)`);
-    try {
-      const result = await updateDownloadManifestAsset(
-        installer.browser_download_url,
-        manifestJson,
-        manifestSig,
-        current,
-        dest,
-      );
-      setMessage(
-        `Verified signed manifest for ${result.version} + SHA256 (${(result.bytes / 1048576).toFixed(1)} MB) and saved. Run the file yourself to update — ${APP_NAME} never installs silently.`,
-      );
-    } catch (error) {
-      const message = typeof error === "string" ? error : "";
-      if (message.includes("not_newer")) {
-        setMessage("Release is not newer than your version. Nothing downloaded.");
-      } else if (
-        message.includes("sig_mismatch") ||
-        message.includes("sha_mismatch") ||
-        message.includes("not_in_manifest")
-      ) {
-        setMessage("VERIFICATION FAILED — file was NOT saved or installed. Treat the release as untrusted.");
-      } else {
-        setMessage("Download failed. Nothing was installed.");
+
+      let dest: string | null = null;
+      try {
+        dest = await pickExportFile(installer.name);
+      } catch {
+        setStatus("File picker failed.");
+        return;
       }
+      if (!dest) {
+        setStatus("Download cancelled — nothing was fetched.");
+        return;
+      }
+
+      setStatus(`Downloading ${installer.name}… (manifest SHA check after download)`);
+      try {
+        const result = await updateDownloadManifestAsset(
+          installer.browser_download_url,
+          manifestJson,
+          manifestSig,
+          current,
+          dest,
+        );
+        setStatus(
+          `Verified signed manifest for ${result.version} and SHA-256 (${(result.bytes / 1048576).toFixed(1)} MB). Saved — run the file yourself to update; ${APP_NAME} never installs silently.`,
+        );
+      } catch (error) {
+        const message = typeof error === "string" ? error : "";
+        if (message.includes("not_newer")) {
+          setStatus("Release is not newer than your version. Nothing downloaded.");
+        } else if (
+          message.includes("sig_mismatch") ||
+          message.includes("sha_mismatch") ||
+          message.includes("not_in_manifest")
+        ) {
+          setStatus("VERIFICATION FAILED — file was NOT saved or installed. Treat the release as untrusted.");
+        } else {
+          setStatus("Download failed. Nothing was installed.");
+        }
+      }
+    } finally {
+      setUpdateBusy(false);
     }
   }
 
-  function handleUpdateNotes() {
+  /**
+   * External links cannot be opened reliably from a Tauri WebView without an
+   * opener plugin, and `window.open` failing silently was the old no-op bug.
+   * Copying the URL with explicit feedback always does something useful; the
+   * full release notes are already shown in the dialog.
+   */
+  async function copyReleaseLink(): Promise<void> {
     const url = updateCheck.release?.html_url;
-    if (!url) return;
+    if (!url) {
+      setStatus("This release has no public page link.");
+      return;
+    }
     try {
-      window.open(url, "_blank", "noopener,noreferrer");
+      await navigator.clipboard.writeText(url);
+      setStatus(`Release link copied: ${url}`);
     } catch {
-      void navigator.clipboard?.writeText(url).catch(() => {});
-      setMessage(`Release notes: ${url} (link copied).`);
-      openSettings();
+      setStatus(`Release link: ${url}`);
     }
   }
 
@@ -191,9 +213,10 @@ export function useUpdater({ openSettings, setMessage }: UpdaterOptions): Update
   return {
     updateCheck,
     updateDismissedTag,
+    updateBusy,
     dismissUpdate,
     checkForUpdates,
     handleUpdateDownload,
-    handleUpdateNotes,
+    copyReleaseLink,
   };
 }

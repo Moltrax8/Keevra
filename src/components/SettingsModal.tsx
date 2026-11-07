@@ -4,7 +4,7 @@ import { Settings } from "lucide-react";
 import type { VaultEntry } from "../vaultApi";
 import { APP_NAME } from "../brand";
 import { parseThemePreference, THEME_OPTIONS, type ThemePreference } from "../theme";
-import type { UpdateCheck } from "./UpdateBanner";
+import type { UpdateCheck } from "./UpdateDialog";
 
 export function SettingsModal({
   vaults,
@@ -19,6 +19,7 @@ export function SettingsModal({
   themePreference,
   onThemeChange,
   updateCheck,
+  updateBusy,
   onCheckUpdates,
   onDownloadUpdate,
 }: {
@@ -34,6 +35,7 @@ export function SettingsModal({
   themePreference: ThemePreference;
   onThemeChange: (preference: ThemePreference) => void;
   updateCheck: UpdateCheck;
+  updateBusy: boolean;
   onCheckUpdates: () => void;
   onDownloadUpdate: () => void;
 }) {
@@ -145,19 +147,28 @@ export function SettingsModal({
           verified before save; you run the installer yourself.
         </p>
         <div className="btn-row">
-          <button type="button" className="btn-secondary" onClick={onCheckUpdates}>
+          <button type="button" className="btn-secondary" onClick={onCheckUpdates} disabled={updateBusy}>
             {updateCheck.phase === "checking" ? "Checking…" : "Check for updates"}
           </button>
           {updateCheck.phase === "available" ? (
-            <button type="button" className="create-form__submit" onClick={onDownloadUpdate}>
-              Download…
+            <button
+              type="button"
+              className="create-form__submit"
+              onClick={onDownloadUpdate}
+              disabled={updateBusy}
+            >
+              {updateBusy ? "Working…" : "Download…"}
             </button>
           ) : null}
         </div>
         {updateCheck.phase === "available" && updateCheck.release ? (
           <p className="hint">
-            {updateCheck.release.tag_name} available (you have {updateCheck.current}).
+            {updateCheck.release.tag_name} available (you have {updateCheck.current}). Close Settings to
+            see the full release notes and choose whether to download.
           </p>
+        ) : null}
+        {updateCheck.phase === "available" && updateCheck.message ? (
+          <p className="hint">{updateCheck.message}</p>
         ) : null}
         {updateCheck.phase === "up-to-date" && updateCheck.message ? (
           <p className="hint">{updateCheck.message}</p>

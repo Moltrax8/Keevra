@@ -18,7 +18,7 @@ import { APP_NAME_HEAD, APP_NAME_TAIL } from "./brand";
 import { useTheme } from "./theme";
 import { serviceIconFor } from "./serviceIcons";
 import { Logo } from "./components/bits";
-import { UpdateBanner } from "./components/UpdateBanner";
+import { UpdateDialog } from "./components/UpdateDialog";
 import { LockScreen } from "./components/LockScreen";
 import { SettingsModal } from "./components/SettingsModal";
 import { AccountList } from "./components/AccountList";
@@ -98,10 +98,7 @@ function App() {
     onLocked,
   });
 
-  const updater = useUpdater({
-    openSettings: () => session.setShowSettings(true),
-    setMessage: session.setPackageMessage,
-  });
+  const updater = useUpdater();
 
   const vaultActive = session.backend === "unlocked";
 
@@ -126,13 +123,15 @@ function App() {
   // Stable view of the close handler for the window listener registered once.
   const closeVault = useEffectEvent(() => session.handleVaultClose());
 
-  // Unexpected window close: commit focused drafts, flush the vault, and only
-  // then let the window go. A failed save cancels the close.
-  const vaultActiveRef = useRef(vaultActive);
+  // Latest session state for the window close handler, read without stale
+  // closures. A ref updated in an effect can lag one commit behind a lock, so
+  // the lock screen could still take the "save first" branch and (if the
+  // destroy permission was unavailable) swallow the close entirely.
+  const needsSaveBeforeClose = useEffectEvent(() => session.backend === "unlocked");
+
+  // Guards against a second close request while the save-then-destroy flow is
+  // already running (e.g. a double click on the title-bar X).
   const closingRef = useRef(false);
-  useEffect(() => {
-    vaultActiveRef.current = vaultActive;
-  }, [vaultActive]);
 
   useEffect(() => {
     let disposed = false;
@@ -142,20 +141,20 @@ function App() {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
         const appWindow = getCurrentWindow();
         const stop = await appWindow.onCloseRequested(async (event) => {
-          event.preventDefault();
-          // Only an unlocked vault needs the save-then-lock gate. Locked,
-          // demo and boot states close immediately; this must be explicit
-          // because the close request has already been prevented.
-          if (!vaultActiveRef.current) {
+          // Locked/boot/demo: never intercept. The native close proceeds even
+          // if the explicit destroy below is denied, so the title-bar X always
+          // works on the lock screen.
+          if (!needsSaveBeforeClose()) {
             try {
               await appWindow.destroy();
-            } catch (error) {
-              // Permission or WebView failure: leave the window usable and
-              // let the user try again instead of silently doing nothing.
-              console.error("Keevra: window close failed", error);
+            } catch {
+              // Native close still proceeds because the event was not prevented.
             }
             return;
           }
+          // Unlocked: hold the close until drafts are flushed and the vault is
+          // on disk, then destroy. A failed save cancels the close.
+          event.preventDefault();
           if (closingRef.current) return;
           closingRef.current = true;
           try {
@@ -194,36 +193,58 @@ function App() {
     accounts.serviceIcons,
   ]);
 
+  // Root-level update announcement: visible on the lock screen as soon as the
+  // background check finds a newer release, and hidden behind Settings so the
+  // two dialogs never stack.
+  const updateDialog =
+    updater.updateCheck.phase === "available" &&
+    updater.updateDismissedTag !== updater.updateCheck.release?.tag_name &&
+    !session.showSettings ? (
+      <UpdateDialog
+        check={updater.updateCheck}
+        busy={updater.updateBusy}
+        onDownload={() => void updater.handleUpdateDownload()}
+        onLater={updater.dismissUpdate}
+        onCopyLink={() => void updater.copyReleaseLink()}
+      />
+    ) : null;
+
   if (session.backend === "checking") {
     return (
-      <main className="app">
-        <div className="boot">
-          <Logo size={52} />
-          <p>Decrypting your universe…</p>
-        </div>
-      </main>
+      <>
+        <main className="app">
+          <div className="boot">
+            <Logo size={52} />
+            <p>Decrypting your universe…</p>
+          </div>
+        </main>
+        {updateDialog}
+      </>
     );
   }
 
   if (session.backend === "locked") {
     return (
-      <LockScreen
-        vaults={session.vaults}
-        defaultPath={session.defaultVaultPath}
-        selectedPath={session.vaultPath}
-        onSelectPath={session.setVaultPath}
-        busy={session.lockBusy}
-        error={session.lockError}
-        notice={session.lockNotice}
-        onCreate={session.handleVaultCreate}
-        onOpen={session.handleVaultOpen}
-        onRestore={session.handleVaultRestore}
-        onForget={session.handleVaultForget}
-        onRemember={session.handleVaultRemember}
-        onRename={session.handleVaultRename}
-        onPickFile={pickImportFile}
-        onDeleteVault={session.handleVaultDelete}
-      />
+      <>
+        <LockScreen
+          vaults={session.vaults}
+          defaultPath={session.defaultVaultPath}
+          selectedPath={session.vaultPath}
+          onSelectPath={session.setVaultPath}
+          busy={session.lockBusy}
+          error={session.lockError}
+          notice={session.lockNotice}
+          onCreate={session.handleVaultCreate}
+          onOpen={session.handleVaultOpen}
+          onRestore={session.handleVaultRestore}
+          onForget={session.handleVaultForget}
+          onRemember={session.handleVaultRemember}
+          onRename={session.handleVaultRename}
+          onPickFile={pickImportFile}
+          onDeleteVault={session.handleVaultDelete}
+        />
+        {updateDialog}
+      </>
     );
   }
 
@@ -343,22 +364,13 @@ function App() {
           themePreference={themePreference}
           onThemeChange={setThemePreference}
           updateCheck={updater.updateCheck}
+          updateBusy={updater.updateBusy}
           onCheckUpdates={() => void updater.checkForUpdates(true)}
           onDownloadUpdate={() => void updater.handleUpdateDownload()}
         />
       ) : null}
 
-      {vaultActive &&
-      updater.updateCheck.phase === "available" &&
-      updater.updateDismissedTag !== updater.updateCheck.release?.tag_name ? (
-        <UpdateBanner
-          check={updater.updateCheck}
-          onViewNotes={updater.handleUpdateNotes}
-          onDownload={() => void updater.handleUpdateDownload()}
-          onLater={updater.dismissUpdate}
-          onRecheck={() => void updater.checkForUpdates(true)}
-        />
-      ) : null}
+      {updateDialog}
 
       <div className="workspace">
         <AccountList

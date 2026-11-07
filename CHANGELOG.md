@@ -4,6 +4,42 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.1] - 2026-11-07
+
+Updater UX release. The update notice now appears before the vault is opened,
+the download path no longer opens Settings, and release notes are readable
+inside the app.
+
+### Fixed
+
+- **Update notice on the lock screen.** The notice lived inside the unlocked
+  layout, so a released version was only announced after unlocking. The update
+  dialog is now rendered at the app root and appears on the lock screen as soon
+  as the background check finds a newer release.
+- **Download no longer opens Settings.** Consent for the download opened the
+  Settings dialog and buried the progress text. Progress and verification
+  results now stay in the update dialog that asked for consent.
+- **Release notes are visible.** `window.open` is unreliable in the Tauri
+  WebView, so "Release notes" appeared to do nothing. The release body is shown
+  inline in the dialog and a "Copy release link" action copies the release URL
+  with visible feedback.
+- **Window close is a native close off the unlocked state.** When the vault is
+  locked, booting or in demo mode the close request is no longer prevented, so
+  the title-bar X works even if an explicit `destroy()` is denied.
+
+### Changed
+
+- **Update decisions in one popup.** A newer release now opens a dialog listing
+  what changed with "Download update…" and "Not now", instead of a passive
+  banner. Nothing is fetched or installed without the user's consent.
+- **Settings update section** reports the same status text as the dialog and
+  disables its buttons while a download is in progress.
+
+### Tests
+
+- New `UpdateDialog` coverage: release notes rendered, both decisions wired,
+  buttons disabled while busy, and the dialog hidden when no update exists.
+
 ## [0.2.0] - 2026-11-06
 
 Security and data-integrity release closing the ten findings (K-01…K-10) of

@@ -174,21 +174,39 @@ jobs:
           path: release-artifacts/*
           if-no-files-found: error
 
+      - name: Compose release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $lines = Get-Content CHANGELOG.md
+          $heading = $lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]" | Select-Object -First 1
+          if (-not $heading) { throw "No CHANGELOG.md section for $version" }
+          $trigger = $false
+          $body = foreach ($line in $lines) {
+            if (-not $trigger -and $line -match "^## \[$([regex]::Escape($version))\]") { $trigger = $true }
+            elseif ($trigger -and $line -match '^## \[') { break }
+            elseif ($trigger) { $line }
+          }
+          $header = if ("${{ steps.signing.outputs.signed }}" -eq "true") {
+            "Draft. Before publishing: attach the offline-signed updates.json and updates.json.minisig, then verify the Authenticode signature and provenance attestation.`n`n"
+          } else {
+            "Unsigned build. Windows SmartScreen will warn that the publisher is unknown. Verify the installer against SHA256SUMS.txt and the build-provenance attestation before running it. See docs/RELEASE_SECURITY.md.`n`n"
+          }
+          Set-Content -Path release-notes.md -Value ($header + ($body -join "`n")) -Encoding utf8
+
       - name: Create or update release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $signed = "${{ steps.signing.outputs.signed }}" -eq "true"
           $exists = gh release view $env:GITHUB_REF_NAME 2>$null
           if ($LASTEXITCODE -ne 0) {
-            if ($signed) {
-              gh release create $env:GITHUB_REF_NAME --draft --title "Keevra $env:GITHUB_REF_NAME" `
-                --notes "Draft. Before publishing: attach the offline-signed updates.json and updates.json.minisig, then verify the Authenticode signature and provenance attestation."
-            } else {
-              gh release create $env:GITHUB_REF_NAME --title "Keevra $env:GITHUB_REF_NAME" `
-                --notes "Unsigned build. Windows SmartScreen will warn that the publisher is unknown. Verify the installer against SHA256SUMS.txt and the build-provenance attestation before running it. See docs/RELEASE_SECURITY.md."
-            }
+            $draftArgs = @()
+            if ("${{ steps.signing.outputs.signed }}" -eq "true") { $draftArgs += "--draft" }
+            gh release create $env:GITHUB_REF_NAME @draftArgs `
+              --title "Keevra $env:GITHUB_REF_NAME" --notes-file release-notes.md
+          } else {
+            gh release edit $env:GITHUB_REF_NAME --notes-file release-notes.md
           }
           $assets = @(Get-ChildItem release-artifacts -File | ForEach-Object { $_.FullName })
           gh release upload $env:GITHUB_REF_NAME $assets --clobber
