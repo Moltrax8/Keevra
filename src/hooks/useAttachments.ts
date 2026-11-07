@@ -1,6 +1,12 @@
 import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import type { Account, AttachmentId, AttachmentMeta } from "../domain";
-import { attachmentExport, attachmentImport, pickExportFile, pickImportFile } from "../vaultApi";
+import {
+  attachmentExport,
+  attachmentImport,
+  pickExportFile,
+  pickImportFile,
+  vaultStatus,
+} from "../vaultApi";
 import { formatBytes, isAttachmentMeta } from "../attachments";
 import { newAttachmentId } from "../ids";
 
@@ -31,8 +37,36 @@ function describeAttachmentError(error: unknown): string {
   if (message.includes("attachment_too_large")) return "File exceeds 25 MB.";
   if (message.includes("attachment_not_found")) return "Attachment file is missing.";
   if (message.includes("attachment_corrupt")) return "Attachment failed verification.";
+  if (message.includes("vault_changed")) {
+    return "The vault changed while the file dialog was open. Try again.";
+  }
   if (message.includes("vault_locked")) return "Vault is locked.";
   return "Attachment operation failed.";
+}
+
+/** Path + session generation of the vault that was open when a dialog began. */
+interface VaultIdentity {
+  path: string;
+  generation: number;
+}
+
+/**
+ * Reads the current backend identity for a long-running file operation.
+ *
+ * Captured *before* the native picker opens so a vault switch during the
+ * dialog cannot retarget the write. The identity is also checked again in Rust
+ * immediately before the blob is touched (K-03).
+ */
+async function captureVaultIdentity(): Promise<VaultIdentity | null> {
+  try {
+    const status = await vaultStatus();
+    if (!status.unlocked || status.path === null || status.generation === null) {
+      return null;
+    }
+    return { path: status.path, generation: status.generation };
+  } catch {
+    return null;
+  }
 }
 
 export function useAttachments({
@@ -67,22 +101,33 @@ export function useAttachments({
     setAttachmentError(null);
     setAttachmentNotice(null);
     setPickerBusy(true);
-    let sourcePath: string | null;
-    try {
-      sourcePath = await pickImportFile();
-    } catch {
-      setAttachmentError("File picker failed.");
-      setPickerBusy(false);
-      return;
-    }
-    if (!sourcePath) {
-      setPickerBusy(false);
-      return;
-    }
 
+    // The whole flow — identity capture, the native picker and the encrypted
+    // write — is one pending task. A lock/switch that starts while the picker
+    // is still open therefore waits for it instead of racing it (K-03).
     const task = (async () => {
+      const identity = await captureVaultIdentity();
+      if (identity === null) {
+        setAttachmentError("Vault is locked.");
+        return;
+      }
+      let sourcePath: string | null;
       try {
-        const meta = await attachmentImport(newAttachmentId(), accountId, sourcePath);
+        sourcePath = await pickImportFile();
+      } catch {
+        setAttachmentError("File picker failed.");
+        return;
+      }
+      if (!sourcePath) return;
+
+      try {
+        const meta = await attachmentImport(
+          newAttachmentId(),
+          accountId,
+          sourcePath,
+          identity.path,
+          identity.generation,
+        );
         // The vault was opened/created/locked while the blob was being
         // written. Its metadata belongs to the old document: never append it
         // to the new vault (K-03).
@@ -116,24 +161,39 @@ export function useAttachments({
     setAttachmentError(null);
     setAttachmentNotice(null);
     setPickerBusy(true);
-    let destPath: string | null;
+
+    const task = (async () => {
+      const identity = await captureVaultIdentity();
+      if (identity === null) {
+        setAttachmentError("Vault is locked.");
+        return;
+      }
+      let destPath: string | null;
+      try {
+        destPath = await pickExportFile(meta.fileName);
+      } catch {
+        setAttachmentError("File picker failed.");
+        return;
+      }
+      if (!destPath) return;
+      try {
+        const bytes = await attachmentExport(
+          meta.id,
+          meta.sha256Hex,
+          destPath,
+          identity.path,
+          identity.generation,
+        );
+        setAttachmentNotice(`Exported ${formatBytes(bytes)} verified.`);
+      } catch (error) {
+        setAttachmentError(describeAttachmentError(error));
+      }
+    })();
+    pendingImports.current.add(task);
     try {
-      destPath = await pickExportFile(meta.fileName);
-    } catch {
-      setAttachmentError("File picker failed.");
-      setPickerBusy(false);
-      return;
-    }
-    if (!destPath) {
-      setPickerBusy(false);
-      return;
-    }
-    try {
-      const bytes = await attachmentExport(meta.id, meta.sha256Hex, destPath);
-      setAttachmentNotice(`Exported ${formatBytes(bytes)} verified.`);
-    } catch (error) {
-      setAttachmentError(describeAttachmentError(error));
+      await task;
     } finally {
+      pendingImports.current.delete(task);
       setPickerBusy(false);
     }
   }

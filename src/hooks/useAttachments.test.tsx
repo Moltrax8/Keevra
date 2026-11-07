@@ -3,7 +3,7 @@ import { act, renderHook } from "@testing-library/react";
 import { useRef, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Account, AttachmentMeta } from "../domain";
-import { attachmentImport, pickImportFile } from "../vaultApi";
+import { attachmentImport, pickImportFile, vaultStatus } from "../vaultApi";
 import { useAttachments, type AttachmentUiApi } from "./useAttachments";
 
 vi.mock("../vaultApi", () => ({
@@ -11,7 +11,11 @@ vi.mock("../vaultApi", () => ({
   attachmentExport: vi.fn(),
   pickImportFile: vi.fn(),
   pickExportFile: vi.fn(),
+  vaultStatus: vi.fn(),
 }));
+
+const VAULT_PATH = "C:\\vault-a\\a.vault";
+const VAULT_GENERATION = 7;
 
 const account: Account = { id: "acc-1", name: "Mail", service: "Mail", tags: [], fields: [] };
 
@@ -70,6 +74,12 @@ describe("useAttachments document epoch (K-03)", () => {
   beforeEach(() => {
     vi.mocked(pickImportFile).mockClear();
     vi.mocked(attachmentImport).mockClear();
+    vi.mocked(vaultStatus).mockReset();
+    vi.mocked(vaultStatus).mockResolvedValue({
+      unlocked: true,
+      path: VAULT_PATH,
+      generation: VAULT_GENERATION,
+    });
   });
 
   it("applies metadata when the document did not change", async () => {
@@ -82,6 +92,14 @@ describe("useAttachments document epoch (K-03)", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
     expect(vi.mocked(attachmentImport).mock.calls.length).toBe(1);
+    // The vault identity captured before the picker is sent with the write.
+    expect(vi.mocked(attachmentImport).mock.calls[0]).toEqual([
+      expect.any(String),
+      "acc-1",
+      "C:\\secret.bin",
+      VAULT_PATH,
+      VAULT_GENERATION,
+    ]);
 
     settle(makeMeta());
     await act(async () => {
@@ -90,6 +108,56 @@ describe("useAttachments document epoch (K-03)", () => {
 
     expect(result.current.attachments).toHaveLength(1);
     expect(result.current.attachments[0].fileName).toBe("secret.bin");
+  });
+
+  it("counts the open picker as pending work and pins the old vault identity", async () => {
+    let resolvePicker!: (path: string | null) => void;
+    vi.mocked(pickImportFile).mockReturnValue(
+      new Promise<string | null>((resolve) => {
+        resolvePicker = resolve;
+      }),
+    );
+    vi.mocked(attachmentImport).mockResolvedValue(makeMeta());
+
+    const { result } = renderHook(() => useHarness(0));
+    let upload!: Promise<void>;
+    await act(async () => {
+      upload = result.current.uploadAttachment();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // The native picker is still open: a vault switch must already see a
+    // pending operation instead of racing it.
+    let finished = false;
+    const waiting = result.current.waitForPending().then(() => {
+      finished = true;
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(finished).toBe(false);
+
+    // Switch vaults while the picker is open, then let it return a file.
+    act(() => {
+      result.current.setEpoch(1);
+    });
+    resolvePicker("C:\\secret.bin");
+    await act(async () => {
+      await Promise.all([upload, waiting]);
+    });
+
+    // The request carries the identity captured before the picker opened, so
+    // Rust rejects a write into the new vault; even if it completed, the
+    // epoch guard keeps the metadata out of the new document.
+    expect(vi.mocked(attachmentImport).mock.calls[0]).toEqual([
+      expect.any(String),
+      "acc-1",
+      "C:\\secret.bin",
+      VAULT_PATH,
+      VAULT_GENERATION,
+    ]);
+    expect(result.current.attachments).toHaveLength(0);
+    expect(result.current.commit).not.toHaveBeenCalled();
   });
 
   it("drops metadata when the vault switched while the import was running", async () => {

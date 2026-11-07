@@ -8,6 +8,8 @@ export type { VaultGraph };
 export interface VaultStatus {
   unlocked: boolean;
   path: string | null;
+  /** Monotonic id for this unlock; null when no session is open. */
+  generation: number | null;
 }
 
 export async function vaultStatus(): Promise<VaultStatus> {
@@ -99,11 +101,15 @@ export async function attachmentImport(
   attachmentId: string,
   nodeId: string,
   sourcePath: string,
+  expectedPath: string,
+  expectedGeneration: number,
 ): Promise<AttachmentMeta> {
   return invoke<AttachmentMeta>("attachment_import", {
     attachmentId,
     nodeId,
     sourcePath,
+    expectedPath,
+    expectedGeneration,
   });
 }
 
@@ -111,8 +117,16 @@ export async function attachmentExport(
   attachmentId: string,
   expectedSha256: string,
   destPath: string,
+  expectedPath: string,
+  expectedGeneration: number,
 ): Promise<number> {
-  return invoke<number>("attachment_export", { attachmentId, expectedSha256, destPath });
+  return invoke<number>("attachment_export", {
+    attachmentId,
+    expectedSha256,
+    destPath,
+    expectedPath,
+    expectedGeneration,
+  });
 }
 
 export interface AttachmentPreview {

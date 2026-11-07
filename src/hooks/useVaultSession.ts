@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   appSettingsGet,
   appSettingsSetDefault,
@@ -45,6 +45,19 @@ export interface VaultSessionOptions {
 export interface VaultDeleteOutcome {
   error: string | null;
   notice: string | null;
+}
+
+/**
+ * An unreadable registry is not "no vaults yet": the backend preserved the
+ * damaged file, so tell the user instead of silently hiding every vault
+ * (N-01).
+ */
+function describeRegistryError(error: unknown): string {
+  const message = typeof error === "string" ? error : "";
+  if (message.includes("registry_corrupt")) {
+    return "The vault list is unreadable. The damaged file was preserved beside vaults.json as a .corrupt-<timestamp> copy; vault files themselves were not touched.";
+  }
+  return "The vault list could not be read or updated. Vault files themselves were not touched.";
 }
 
 export interface VaultSessionApi {
@@ -96,6 +109,14 @@ export function useVaultSession({
   const [lockBusy, setLockBusy] = useState(false);
   const [lockError, setLockError] = useState<string | null>(null);
   const [lockNotice, setLockNotice] = useState<string | null>(null);
+  // Last successfully read listing. A failed refresh keeps this visible
+  // instead of replacing the user's vaults with an empty list (N-01).
+  const vaultsRef = useRef<VaultEntry[]>([]);
+
+  function applyVaults(entries: VaultEntry[]) {
+    vaultsRef.current = entries;
+    setVaults(entries);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -103,7 +124,17 @@ export function useVaultSession({
       try {
         const status = await vaultStatus();
         if (cancelled) return;
-        const entries = await vaultList().catch((): VaultEntry[] => []);
+        let entries: VaultEntry[];
+        try {
+          entries = await vaultList();
+        } catch (error) {
+          if (cancelled) return;
+          // Corrupt/unreadable registry: report it, but keep going so an
+          // already-unlocked backend session can still be reopened below.
+          setLockError(describeRegistryError(error));
+          entries = [];
+        }
+        vaultsRef.current = entries;
         if (cancelled) return;
         setVaults(entries);
         const settings = await appSettingsGet().catch(() => null);
@@ -144,9 +175,16 @@ export function useVaultSession({
   }, []);
 
   async function refreshVaults(): Promise<VaultEntry[]> {
-    const entries = await vaultList().catch((): VaultEntry[] => []);
-    setVaults(entries);
-    return entries;
+    try {
+      const entries = await vaultList();
+      applyVaults(entries);
+      return entries;
+    } catch (error) {
+      // Never fabricate an empty list: keep the last known entries and show
+      // the registry problem (N-01).
+      setLockError(describeRegistryError(error));
+      return vaultsRef.current;
+    }
   }
 
   /**
@@ -221,7 +259,7 @@ export function useVaultSession({
       applyVaultDocument(created.graph);
       setVaultPath(created.path);
       setVaultName(name);
-      setVaults(await refreshVaults());
+      await refreshVaults();
       setBackend("unlocked");
       return true;
     } catch (error) {
@@ -239,9 +277,11 @@ export function useVaultSession({
 
   async function handleVaultRemember(name: string, path: string, hint: string): Promise<boolean> {
     try {
-      setVaults(await vaultRemember(name, path, hint === "" ? undefined : hint));
+      applyVaults(await vaultRemember(name, path, hint === "" ? undefined : hint));
       return true;
-    } catch {
+    } catch (error) {
+      const message = typeof error === "string" ? error : "";
+      if (message.includes("registry_corrupt")) setLockError(describeRegistryError(error));
       return false;
     }
   }
@@ -299,7 +339,7 @@ export function useVaultSession({
       applyVaultDocument(created.graph);
       setVaultPath(created.path);
       setVaultName(name);
-      setVaults(await refreshVaults());
+      await refreshVaults();
       setShowSettings(false);
       return null;
     } catch (error) {
@@ -315,24 +355,27 @@ export function useVaultSession({
   async function handleVaultForget(path: string) {
     try {
       const entries = await vaultForget(path);
-      setVaults(entries);
+      applyVaults(entries);
       if (vaultPath === path) {
         setVaultPath(entries[0]?.path ?? "");
       }
-    } catch {
-      // Listing failures leave existing state untouched.
+    } catch (error) {
+      // Writers refuse to overwrite a corrupt registry, so a silent failure
+      // would hide a real recovery problem (N-01).
+      setLockError(describeRegistryError(error));
     }
   }
 
   async function handleVaultRename(path: string, name: string): Promise<string | null> {
     if (name === "") return "Enter a vault name.";
     try {
-      setVaults(await vaultRename(path, name));
+      applyVaults(await vaultRename(path, name));
       return null;
     } catch (error) {
       const message = typeof error === "string" ? error : "";
       if (message.includes("duplicate_vault_name")) return "You already have a vault with this name.";
       if (message.includes("invalid_vault_name")) return "Enter a vault name.";
+      if (message.includes("registry_corrupt")) return describeRegistryError(error);
       return "Could not rename the vault.";
     }
   }
@@ -408,7 +451,7 @@ export function useVaultSession({
     }
     try {
       const entries = await vaultImportPackage(source, name);
-      setVaults(entries);
+      applyVaults(entries);
       setPackageMessage(`Imported “${name}”. Open it from the lock screen with its original password.`);
     } catch {
       setPackageMessage("Package import failed (bad file or name).");

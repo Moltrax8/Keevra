@@ -4,6 +4,53 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.2] - 2026-11-07
+
+Follow-up to the independent review of `440dfd7`, closing K-01, K-03, N-01,
+K-05a and N-02. No format or on-disk schema changes; existing vaults, backups
+and packages remain compatible.
+
+### Security
+
+- **Delete retries finish cleanup after a partial failure (K-01).** A managed
+  vault's identity is now derived from the resolved parent directory plus the
+  file name instead of requiring the live file to exist. A retry after the live
+  file was already removed therefore still deletes every backup generation, the
+  pre-restore copy and the attachment blob directory. Blob directories are
+  removed without following reparse points or junctions, and the listing is
+  dropped only when no artifact remains.
+- **Attachment writes are pinned to the vault that opened the picker (K-03).**
+  The renderer captures the vault path and session generation before the native
+  file dialog opens, and the dialog phase itself counts as pending work, so a
+  lock or vault switch waits for it. Rust verifies the expected path and
+  generation immediately before writing and refuses with `vault_changed`
+  instead of writing into a different vault.
+- **Package parsing is bounded end to end (K-05a).** Import opens the package
+  once, reads the size from that same handle and parses through
+  `take(MAX_PACKAGE_BYTES + 1)`. Reaching the cap is a rejection
+  (`package_too_large`) even when the leading bytes form valid JSON, so a file
+  that grows after the metadata check cannot bypass the ceiling.
+
+### Fixed
+
+- **A corrupt vault registry is no longer treated as an empty list (N-01).**
+  Registry reads return a result and only a missing file means "no vaults yet".
+  A corrupt or unreadable `vaults.json` is preserved as
+  `vaults.json.corrupt-<timestamp>`, writers refuse to overwrite it, and the UI
+  reports the problem instead of silently hiding every vault.
+- **Crash-leftover import staging is cleaned up (N-02).** Startup and the next
+  package import remove `.import-<32 hex>.vault` and
+  `.import-<32 hex>.vault.attachments` entries older than one hour without
+  traversing reparse points. Fresh staging entries and lookalike user files are
+  left untouched.
+
+### Tests
+
+- Regression coverage for managed delete after the live file is gone, registry
+  corruption preservation, identity for a missing vault file, package growth
+  past the cap (including truncation exactly at the cap), stale staging
+  cleanup, and the picker-open vault-switch race.
+
 ## [0.2.1] - 2026-11-07
 
 Updater UX release. The update notice now appears before the vault is opened,

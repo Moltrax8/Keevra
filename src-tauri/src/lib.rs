@@ -6,7 +6,14 @@ mod update_keys;
 mod updates;
 mod vault;
 
-use std::{path::PathBuf, sync::Mutex, time::{Duration, Instant}};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, Manager, State};
 use vault::{GraphData, KdfCost, VaultError};
 use zeroize::Zeroizing;
@@ -29,10 +36,21 @@ struct VaultSession {
     /// Cost the key was derived with; re-used verbatim on every save.
     kdf: KdfCost,
     path: PathBuf,
+    /// Monotonic id for this unlock. Attachment writes capture it together
+    /// with the vault path; a write that arrives after a lock/open/switch is
+    /// refused before it can touch the wrong vault (K-03).
+    generation: u64,
     last_touch: Instant,
 }
 
 struct VaultState(Mutex<Option<VaultSession>>);
+
+/// Source of session generations. Starts at 1 so `0` can mean "no session".
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_generation() -> u64 {
+    NEXT_SESSION_GENERATION.fetch_add(1, Ordering::SeqCst)
+}
 
 /// A panicked command must never leave the session permanently unreachable
 /// (or permanently unlockable). Recovering the poisoned guard keeps
@@ -50,6 +68,7 @@ fn lock_session<'a>(
 struct VaultStatus {
     unlocked: bool,
     path: Option<String>,
+    generation: Option<u64>,
 }
 
 /// True when a session has been idle past the backstop limit. Kept as a helper
@@ -73,7 +92,7 @@ fn expire_idle_session(session: &mut Option<VaultSession>) -> bool {
 
 fn session_path(
     state: &State<VaultState>,
-) -> Result<(Zeroizing<[u8; 32]>, [u8; 16], KdfCost, PathBuf), VaultError> {
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 16], KdfCost, PathBuf, u64), VaultError> {
     let mut guard = lock_session(state);
     if expire_idle_session(&mut guard) {
         return Err(VaultError::Io("vault_locked".to_string()));
@@ -86,27 +105,42 @@ fn session_path(
                 session.salt,
                 session.kdf,
                 session.path.clone(),
+                session.generation,
             ))
         }
         None => Err(VaultError::Io("vault_locked".to_string())),
     }
 }
 
+/// Session handle captured by a long-running attachment operation. The
+/// expected path and generation must still match the live session immediately
+/// before the write (K-03); otherwise the command fails without touching disk.
+fn guarded_session(
+    state: &State<VaultState>,
+    expected_path: &str,
+    expected_generation: u64,
+) -> Result<(Zeroizing<[u8; 32]>, PathBuf), VaultError> {
+    let (key, _, _, path, generation) = session_path(state)?;
+    if generation != expected_generation || path.to_string_lossy() != expected_path {
+        return Err(VaultError::Io("vault_changed".to_string()));
+    }
+    Ok((key, path))
+}
+
 #[tauri::command]
 fn vault_status(state: State<VaultState>) -> VaultStatus {
     let mut guard = lock_session(&state);
     expire_idle_session(&mut guard);
-    match guard
-        .as_ref()
-        .map(|session| session.path.to_string_lossy().to_string())
-    {
-        Some(path) => VaultStatus {
+    match guard.as_ref() {
+        Some(session) => VaultStatus {
             unlocked: true,
-            path: Some(path),
+            path: Some(session.path.to_string_lossy().to_string()),
+            generation: Some(session.generation),
         },
         None => VaultStatus {
             unlocked: false,
             path: None,
+            generation: None,
         },
     }
 }
@@ -133,7 +167,7 @@ fn vault_touch(state: State<VaultState>) -> Result<(), String> {
 /// is open, so the UI must never guess (or fall back to demo data).
 #[tauri::command]
 fn vault_get_document(state: State<VaultState>) -> Result<GraphData, String> {
-    let (key, _, _, path) = session_path(&state).map_err(String::from)?;
+    let (key, _, _, path, _) = session_path(&state).map_err(String::from)?;
     let contents = vault::read_vault_file(&path).map_err(String::from)?;
     vault::open_envelope_with_key(&contents, &key).map_err(String::from)
 }
@@ -144,7 +178,7 @@ fn vault_list(app: AppHandle) -> Result<Vec<registry::VaultEntry>, String> {
         .path()
         .app_data_dir()
         .map_err(|e| VaultError::Io(e.to_string()))?;
-    Ok(registry::read_registry(&registry::registry_path(&dir)))
+    registry::read_registry_preserving(&registry::registry_path(&dir)).map_err(String::from)
 }
 
 #[derive(serde::Serialize)]
@@ -189,6 +223,7 @@ fn vault_create(
         salt,
         kdf,
         path: vault_path,
+        generation: next_session_generation(),
         last_touch: Instant::now(),
     });
     Ok(CreatedVault {
@@ -264,6 +299,14 @@ struct VaultDeleteResult {
     listing_removed: bool,
 }
 
+/// A session holds `vault_path` when the raw paths match or their identities
+/// do (resolved parent + file name). Identity comparison also works when the
+/// live file is missing after a partial delete.
+fn session_holds_path(session: &VaultSession, vault_path: &Path) -> bool {
+    session.path == vault_path
+        || registry::path_identity(&session.path).as_deref() == Some(vault_path)
+}
+
 /// Destructive, owner-confirmed reset for a forgotten password: removes the
 /// vault file, its backup, its attachment blobs, and its registry listing.
 /// There is no recovery — local encryption has no backdoor by design.
@@ -288,25 +331,28 @@ fn vault_delete_vault(
     if !registry::is_registered(&registry_path, &path) {
         return Err(VaultError::Io("vault_not_listed".to_string()).to_string());
     }
-    let vault_path = PathBuf::from(&path);
 
-    // Never delete the vault the session currently holds open.
-    {
-        let guard = lock_session(&state);
-        if guard.as_ref().is_some_and(|session| session.path == vault_path) {
-            return Err(VaultError::Io("vault_unlocked".to_string()).to_string());
-        }
-    }
-
-    // Externally located vaults are only unlisted; the app never deletes a
-    // file outside its own data directory.
-    if !registry::is_app_managed(&dir, &path) {
+    // Managed-ness is derived from the path identity (resolved parent + file
+    // name), not from the live file existing. A retry after an interrupted
+    // delete therefore still cleans the backup and blob side files (K-01).
+    let Some(vault_path) = registry::managed_vault_path(&dir, &path) else {
         registry::forget_vault(&registry_path, &path).map_err(String::from)?;
         clear_default_if_matches(&dir, &path)?;
         return Ok(VaultDeleteResult {
             files_deleted: false,
             listing_removed: true,
         });
+    };
+
+    // Never delete the vault the session currently holds open.
+    {
+        let guard = lock_session(&state);
+        if guard
+            .as_ref()
+            .is_some_and(|session| session_holds_path(session, &vault_path))
+        {
+            return Err(VaultError::Io("vault_unlocked".to_string()).to_string());
+        }
     }
 
     // An existing file must still look like a vault before it is destroyed.
@@ -346,15 +392,37 @@ fn remove_managed_vault_files(vault_path: &std::path::Path) -> Result<(), String
     }
     remove_if_exists(&vault::pre_restore_path_for(vault_path), &mut failures);
     let blob_dir = attachments::attachments_dir(vault_path);
-    match std::fs::remove_dir_all(&blob_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => failures.push(format!("{}: {error}", blob_dir.display())),
-    }
+    remove_blob_dir(&blob_dir, &mut failures);
     if failures.is_empty() {
         Ok(())
     } else {
         Err(format!("delete_failed: {}", failures.join("; ")))
+    }
+}
+
+/// Removes the blob directory without ever traversing a link/junction: a
+/// reparse point is unlinked itself, so a hostile or accidental link cannot
+/// make "delete vault" erase a directory outside the managed vault root.
+fn remove_blob_dir(blob_dir: &Path, failures: &mut Vec<String>) {
+    match std::fs::symlink_metadata(blob_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if let Err(error) = std::fs::remove_dir(blob_dir)
+                .or_else(|_| std::fs::remove_file(blob_dir))
+            {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("{}: {error}", blob_dir.display()));
+                }
+            }
+        }
+        Ok(_) => {
+            if let Err(error) = std::fs::remove_dir_all(blob_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    failures.push(format!("{}: {error}", blob_dir.display()));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!("{}: {error}", blob_dir.display())),
     }
 }
 
@@ -395,6 +463,7 @@ fn vault_open(
         salt,
         kdf,
         path: vault_path,
+        generation: next_session_generation(),
         last_touch: Instant::now(),
     });
     Ok(graph)
@@ -406,7 +475,7 @@ fn vault_save(
     graph: GraphData,
     retain_attachment_ids: Vec<String>,
 ) -> Result<(), String> {
-    let (key, salt, kdf, path) = session_path(&state).map_err(String::from)?;
+    let (key, salt, kdf, path, _) = session_path(&state).map_err(String::from)?;
     vault::save_vault(&path, &graph, &key, &salt, kdf).map_err(String::from)?;
     // Best-effort orphan sweep: keep blobs referenced by the new document,
     // the verified backup (restore must never miss blobs), plus any the UI
@@ -459,9 +528,13 @@ fn vault_restore_backup(
         return Err(VaultError::Io("vault_not_listed".to_string()).to_string());
     }
     let vault_path = PathBuf::from(&path);
+    let vault_identity = registry::path_identity(&vault_path).unwrap_or_else(|| vault_path.clone());
     {
         let guard = lock_session(&state);
-        if guard.as_ref().is_some_and(|session| session.path == vault_path) {
+        if guard
+            .as_ref()
+            .is_some_and(|session| session.path == vault_identity || registry::path_identity(&session.path).as_deref() == Some(vault_identity.as_path()))
+        {
             return Err(VaultError::Io("vault_unlocked".to_string()).to_string());
         }
     }
@@ -475,8 +548,11 @@ fn attachment_import(
     attachment_id: String,
     node_id: String,
     source_path: String,
+    expected_path: String,
+    expected_generation: u64,
 ) -> Result<attachments::AttachmentMeta, String> {
-    let (key, _, _, path) = session_path(&state).map_err(String::from)?;
+    let (key, path) =
+        guarded_session(&state, &expected_path, expected_generation).map_err(String::from)?;
     attachments::attachment_import(&key, &path, &attachment_id, &node_id, &PathBuf::from(source_path))
         .map_err(String::from)
 }
@@ -487,8 +563,11 @@ fn attachment_export(
     attachment_id: String,
     expected_sha256: String,
     dest_path: String,
+    expected_path: String,
+    expected_generation: u64,
 ) -> Result<u64, String> {
-    let (key, _, _, path) = session_path(&state).map_err(String::from)?;
+    let (key, path) =
+        guarded_session(&state, &expected_path, expected_generation).map_err(String::from)?;
     attachments::attachment_export(&key, &path, &attachment_id, &expected_sha256, &PathBuf::from(dest_path))
         .map_err(String::from)
 }
@@ -499,13 +578,13 @@ fn attachment_read(
     attachment_id: String,
     expected_sha256: String,
 ) -> Result<attachments::AttachmentPreview, String> {
-    let (key, _, _, path) = session_path(&state).map_err(String::from)?;
+    let (key, _, _, path, _) = session_path(&state).map_err(String::from)?;
     attachments::attachment_read(&key, &path, &attachment_id, &expected_sha256).map_err(String::from)
 }
 
 #[tauri::command]
 fn vault_export_package(state: State<VaultState>, dest_path: String) -> Result<usize, String> {
-    let (key, _, _, path) = session_path(&state).map_err(String::from)?;
+    let (key, _, _, path, _) = session_path(&state).map_err(String::from)?;
     package::export_package(&path, &PathBuf::from(dest_path), Some(&key)).map_err(String::from)
 }
 
@@ -523,6 +602,12 @@ fn vault_import_package(
     std::fs::create_dir_all(registry::vaults_dir(&dir))
         .map_err(|e| VaultError::Io(e.to_string()))
         .map_err(String::from)?;
+    // Reap abandoned staging files from an earlier crash before creating new
+    // ones (N-02). Age-gated so a concurrent import is never touched.
+    let _ = package::cleanup_stale_imports(
+        &registry::vaults_dir(&dir),
+        package::STALE_IMPORT_AGE,
+    );
     let dest = registry::vaults_dir(&dir).join(registry::random_vault_filename());
     package::import_package(&PathBuf::from(&source_path), &dest).map_err(String::from)?;
     let dest_string = dest.to_string_lossy().to_string();
@@ -585,6 +670,15 @@ pub fn run() {
         // friendly path, but a suspended or compromised renderer must not keep
         // the master key alive past the 15-minute backstop (K-08).
         .setup(|app| {
+            // Reap staging files left by an import that was interrupted by a
+            // crash or power loss. Ciphertext never stays behind indefinitely
+            // in the managed vault root (N-02).
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = package::cleanup_stale_imports(
+                    &registry::vaults_dir(&dir),
+                    package::STALE_IMPORT_AGE,
+                );
+            }
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(SESSION_WATCHDOG_INTERVAL);
@@ -655,6 +749,7 @@ mod tests {
             salt: [0u8; 16],
             kdf: KdfCost::default(),
             path: PathBuf::from("test.vault"),
+            generation: 1,
             last_touch,
         };
 

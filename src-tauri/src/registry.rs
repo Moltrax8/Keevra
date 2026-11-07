@@ -9,7 +9,34 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::vault::{write_atomic, VaultError};#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+use crate::vault::{write_atomic, VaultError};
+
+/// A registry file that exists but cannot be read or parsed.
+///
+/// Kept distinct from "no registry yet" so an unreadable list is never treated
+/// as an empty list and then overwritten by the next write (N-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryCorrupt(pub String);
+
+impl std::fmt::Display for RegistryCorrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "registry_corrupt: {}", self.0)
+    }
+}
+
+impl From<RegistryCorrupt> for VaultError {
+    fn from(error: RegistryCorrupt) -> Self {
+        VaultError::Io(error.to_string())
+    }
+}
+
+impl From<RegistryCorrupt> for String {
+    fn from(error: RegistryCorrupt) -> String {
+        error.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultEntry {
     pub name: String,
@@ -98,12 +125,82 @@ pub fn vaults_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("keevra")
 }
 
-pub fn read_registry(registry: &Path) -> Vec<VaultEntry> {
-    let entries: Vec<VaultEntry> = std::fs::read_to_string(registry)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default();
-    with_metadata(entries)
+/// Reads the registry. A missing file is the only "empty list" case: any other
+/// read/parse failure is reported as corruption so callers can preserve the
+/// file instead of silently discarding the user's vault names and hints
+/// (N-01).
+pub fn read_registry(registry: &Path) -> Result<Vec<VaultEntry>, RegistryCorrupt> {
+    let contents = match std::fs::read_to_string(registry) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(RegistryCorrupt(error.to_string())),
+    };
+    let entries: Vec<VaultEntry> =
+        serde_json::from_str(&contents).map_err(|error| RegistryCorrupt(error.to_string()))?;
+    Ok(with_metadata(entries))
+}
+
+fn quarantine_path(registry: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut candidate = registry.as_os_str().to_owned();
+    candidate.push(format!(".corrupt-{stamp}"));
+    let mut candidate = PathBuf::from(candidate);
+    let mut suffix = 1;
+    while candidate.exists() {
+        let mut next = registry.as_os_str().to_owned();
+        next.push(format!(".corrupt-{stamp}-{suffix}"));
+        candidate = PathBuf::from(next);
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Reads the registry, preserving an unreadable/corrupt file under
+/// `vaults.json.corrupt-<timestamp>` instead of returning an empty list.
+///
+/// Writers call [`read_registry`] directly, so a corrupt list is never
+/// overwritten in place; the preserved copy is available for manual recovery.
+pub fn read_registry_preserving(registry: &Path) -> Result<Vec<VaultEntry>, RegistryCorrupt> {
+    match read_registry(registry) {
+        Ok(entries) => Ok(entries),
+        Err(error) => {
+            let preserved = quarantine_path(registry);
+            match std::fs::rename(registry, &preserved) {
+                Ok(()) => Err(RegistryCorrupt(format!(
+                    "{}; preserved as {}",
+                    error.0,
+                    preserved.display()
+                ))),
+                Err(rename_error) => Err(RegistryCorrupt(format!(
+                    "{}; could not preserve the file ({rename_error})",
+                    error.0
+                ))),
+            }
+        }
+    }
+}
+
+/// Stable identity for a registered vault path even when the live file is
+/// already gone: resolve the parent directory (which still exists during a
+/// retry) and append the file name. Never follows the file itself, so a
+/// missing file or a link is identified without touching its target.
+pub fn path_identity(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())?;
+    let parent = std::fs::canonicalize(parent).ok()?;
+    Some(parent.join(name))
+}
+
+fn entry_matches(entry_path: &str, path: &str, identity: Option<&Path>) -> bool {
+    entry_path == path
+        || identity.is_some_and(|identity| {
+            path_identity(Path::new(entry_path)).as_deref() == Some(identity)
+        })
 }
 
 fn write_registry(registry: &Path, entries: &[VaultEntry]) -> Result<(), VaultError> {
@@ -153,8 +250,12 @@ pub fn remember_vault(
     if trimmed.is_empty() {
         return Err(VaultError::Io("invalid_vault_name".to_string()));
     }
-    let mut entries = read_registry(registry);
-    if let Some(entry) = entries.iter_mut().find(|entry| entry.path == path) {
+    let mut entries = read_registry(registry)?;
+    let identity = path_identity(Path::new(path));
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry_matches(&entry.path, path, identity.as_deref()))
+    {
         entry.name = trimmed.to_string();
         entry.hint = hint
             .map(str::trim)
@@ -178,18 +279,22 @@ pub fn remember_vault(
 
 /// Renames the listing for an existing vault path.
 pub fn rename_vault(registry: &Path, path: &str, name: &str) -> Result<Vec<VaultEntry>, VaultError> {
-    let entries = read_registry(registry);
-    if !entries.iter().any(|entry| entry.path == path) {
-        return Err(VaultError::Io("vault_not_listed".to_string()));
-    }
-    let hint = entries
+    let entries = read_registry(registry)?;
+    let identity = path_identity(Path::new(path));
+    let listed = entries
         .iter()
-        .find(|entry| entry.path == path)
-        .and_then(|entry| entry.hint.clone());
+        .find(|entry| entry_matches(&entry.path, path, identity.as_deref()));
+    let Some(listed) = listed else {
+        return Err(VaultError::Io("vault_not_listed".to_string()));
+    };
+    let hint = listed.hint.clone();
     remember_vault(registry, name, path, None).and_then(|_| {
         // Preserve the existing hint across renames.
-        let mut updated = read_registry(registry);
-        if let Some(entry) = updated.iter_mut().find(|entry| entry.path == path) {
+        let mut updated = read_registry(registry)?;
+        if let Some(entry) = updated
+            .iter_mut()
+            .find(|entry| entry_matches(&entry.path, path, identity.as_deref()))
+        {
             entry.hint = hint;
         }
         write_registry(registry, &updated)?;
@@ -201,42 +306,44 @@ pub fn rename_vault(registry: &Path, path: &str, name: &str) -> Result<Vec<Vault
 /// commands (delete, restore) require this so an arbitrary path can never be
 /// operated on through the frontend bridge.
 pub fn is_registered(registry: &Path, path: &str) -> bool {
-    let entries = read_registry(registry);
-    if entries.iter().any(|entry| entry.path == path) {
-        return true;
-    }
-    let Ok(candidate) = std::fs::canonicalize(path) else {
+    let Ok(entries) = read_registry(registry) else {
         return false;
     };
-    entries.iter().any(|entry| {
-        std::fs::canonicalize(&entry.path)
-            .map(|registered| registered == candidate)
-            .unwrap_or(false)
-    })
+    let identity = path_identity(Path::new(path));
+    entries
+        .iter()
+        .any(|entry| entry_matches(&entry.path, path, identity.as_deref()))
 }
 
-/// True only when `path` is a `.vault` file directly inside the app-managed
-/// vault directory (after resolving links/junctions). Externally located
-/// vaults can be listed and opened, but never deleted through the app: for
-/// them only the listing may be removed.
-pub fn is_app_managed(app_data_dir: &Path, path: &str) -> bool {
-    let Ok(candidate) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let Ok(dir) = std::fs::canonicalize(vaults_dir(app_data_dir)) else {
-        return false;
-    };
-    candidate.parent() == Some(dir.as_path())
-        && candidate
+/// Canonical path of an app-managed vault, computed without requiring the live
+/// file to exist.
+///
+/// Only a plain `.vault` file directly inside the canonical app vault
+/// directory is accepted. Resolving the *parent* rather than the file is what
+/// lets a retry after a partial delete still recognize (and clean) the backup
+/// and blob side files (K-01), while `starts_with`-style prefix confusion and
+/// link traversal through the parent are avoided.
+pub fn managed_vault_path(app_data_dir: &Path, path: &str) -> Option<PathBuf> {
+    let candidate = path_identity(Path::new(path))?;
+    let name = candidate.file_name()?.to_str()?;
+    if name.len() > 200
+        || name.chars().any(char::is_control)
+        || !candidate
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("vault"))
+    {
+        return None;
+    }
+    let dir = std::fs::canonicalize(vaults_dir(app_data_dir)).ok()?;
+    (candidate.parent() == Some(dir.as_path())).then_some(candidate)
 }
 
 /// Forgets a listing only; the vault file itself is never touched.
 pub fn forget_vault(registry: &Path, path: &str) -> Result<Vec<VaultEntry>, VaultError> {
-    let mut entries = read_registry(registry);
-    entries.retain(|entry| entry.path != path);
+    let mut entries = read_registry(registry)?;
+    let identity = path_identity(Path::new(path));
+    entries.retain(|entry| !entry_matches(&entry.path, path, identity.as_deref()));
     write_registry(registry, &entries)?;
     Ok(entries)
 }
@@ -270,7 +377,7 @@ mod tests {
     fn remember_renames_forget_keeps_file() {
         let registry = sandbox_registry();
         let _ = std::fs::remove_file(&registry);
-        assert_eq!(read_registry(&registry), vec![]);
+        assert_eq!(read_registry(&registry).expect("missing registry is empty"), vec![]);
         let entries = remember_vault(&registry, "Personal", "/tmp/abc.vault", None).expect("remember");
         assert_eq!(entries.len(), 1);
         let renamed = remember_vault(&registry, "Personal 2", "/tmp/abc.vault", None).expect("rename");
@@ -289,7 +396,7 @@ mod tests {
         remember_vault(&registry, "Personal", "/tmp/a.vault", None).expect("first");
         // Same display name twice is fine: random filenames stay distinct.
         remember_vault(&registry, "personal", "/tmp/b.vault", None).expect("duplicate allowed");
-        let listed = read_registry(&registry);
+        let listed = read_registry(&registry).expect("registry");
         assert_eq!(listed.len(), 2);
         assert_ne!(listed[0].path, listed[1].path);
         // Renaming onto an existing name is allowed too.
@@ -313,9 +420,9 @@ mod tests {
         let not_vault = managed_dir.join("notes.txt");
         std::fs::write(&not_vault, b"text").expect("text file");
 
-        assert!(is_app_managed(&root, &managed.to_string_lossy()));
-        assert!(!is_app_managed(&root, &outside.to_string_lossy()));
-        assert!(!is_app_managed(&root, &not_vault.to_string_lossy()));
+        assert!(managed_vault_path(&root, &managed.to_string_lossy()).is_some());
+        assert!(managed_vault_path(&root, &outside.to_string_lossy()).is_none());
+        assert!(managed_vault_path(&root, &not_vault.to_string_lossy()).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -341,7 +448,76 @@ mod tests {
         let stored: Vec<VaultEntry> =
             serde_json::from_str(&std::fs::read_to_string(&registry).expect("read")).expect("parse");
         assert_eq!(stored[0].size_bytes, None);
-        assert_eq!(read_registry(&registry)[0].size_bytes, Some(10));
+        assert_eq!(read_registry(&registry).expect("registry")[0].size_bytes, Some(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_identity_survives_a_missing_live_file() {
+        let root = std::env::temp_dir().join(format!("keevra-managed-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let managed_dir = vaults_dir(&root);
+        std::fs::create_dir_all(&managed_dir).expect("vault dir");
+        let missing = managed_dir.join("gone.vault");
+        assert!(!missing.exists());
+
+        let expected = std::fs::canonicalize(&managed_dir)
+            .expect("canonical dir")
+            .join("gone.vault");
+        assert_eq!(
+            managed_vault_path(&root, &missing.to_string_lossy()),
+            Some(expected)
+        );
+        assert!(managed_vault_path(&root, &missing.to_string_lossy()).is_some());
+        // Outside the managed directory, and non-vault extensions, stay
+        // unmanaged even though the paths are syntactically fine.
+        assert_eq!(
+            managed_vault_path(&root, &root.join("gone.vault").to_string_lossy()),
+            None
+        );
+        assert_eq!(
+            managed_vault_path(&root, &managed_dir.join("notes.txt").to_string_lossy()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_registry_is_preserved_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("keevra-regcorrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let registry = dir.join("vaults.json");
+        std::fs::write(&registry, b"{not valid json").expect("corrupt fixture");
+
+        // A plain read reports corruption; it never fabricates an empty list.
+        assert!(read_registry(&registry).is_err());
+        // Writers refuse to replace the corrupt file.
+        assert!(remember_vault(&registry, "New", "/tmp/new.vault", None).is_err());
+        assert!(forget_vault(&registry, "/tmp/old.vault").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&registry).expect("still there"),
+            "{not valid json"
+        );
+
+        // The listing path preserves the corrupt file under a timestamped name.
+        let error = read_registry_preserving(&registry).expect_err("corrupt");
+        assert!(error.0.contains("preserved as"));
+        assert!(!registry.exists());
+        let preserved = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .map(|entry| entry.path())
+            .expect("preserved copy");
+        assert_eq!(
+            std::fs::read_to_string(&preserved).expect("preserved contents"),
+            "{not valid json"
+        );
+
+        // Only after preservation does a missing registry mean an empty list.
+        assert_eq!(read_registry(&registry).expect("empty now"), vec![]);
+        remember_vault(&registry, "New", "/tmp/new.vault", None).expect("write after recovery");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

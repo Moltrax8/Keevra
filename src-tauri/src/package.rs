@@ -9,7 +9,13 @@
 //! Import writes to a fresh random `<uuid>.vault` path chosen by the caller.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Read,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use crate::vault::{read_limited, write_atomic, VaultError};
 
@@ -21,6 +27,11 @@ const LEGACY_PACKAGE_FORMAT: &str = "vaulttrax-package";
 /// the old 1 GiB ceiling that could stall or OOM the app (K-05).
 pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ATTACHMENTS: usize = 10_000;
+/// Prefix and age gate for crash-leftover staging cleanup (N-02).
+const IMPORT_PREFIX: &str = ".import-";
+/// Staging entries younger than this may belong to a live import in another
+/// process, so startup GC leaves them alone.
+pub const STALE_IMPORT_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BlobEntry {
@@ -135,19 +146,10 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
     if dest_vault_path.exists() {
         return Err(VaultError::AlreadyExists);
     }
-    // Check the size from metadata first, then parse straight from a buffered
-    // file reader: the old path kept the raw byte buffer *and* the parsed
-    // package in memory at the same time (K-05).
-    let metadata = fs::metadata(source_path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            VaultError::NotFound
-        } else {
-            VaultError::Io(error.to_string())
-        }
-    })?;
-    if metadata.len() > MAX_PACKAGE_BYTES {
-        return Err(VaultError::Io("package_too_large".to_string()));
-    }
+    // One open handle is used for both the size check and the parse, so the
+    // file cannot be swapped between those steps. The reader is capped with
+    // `take(limit + 1)`; reaching the cap is itself a rejection, which also
+    // catches a file that grows while it is being read (K-05a).
     let file = fs::File::open(source_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             VaultError::NotFound
@@ -155,12 +157,11 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
             VaultError::Io(error.to_string())
         }
     })?;
-    let mut deserializer = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-    let package = Package::deserialize(&mut deserializer)
-        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    deserializer
-        .end()
-        .map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
+    let metadata = file.metadata().map_err(|error| VaultError::Io(error.to_string()))?;
+    if metadata.len() > MAX_PACKAGE_BYTES {
+        return Err(VaultError::Io("package_too_large".to_string()));
+    }
+    let package = parse_package_bounded(file, MAX_PACKAGE_BYTES)?;
     // Accept the current format and the legacy name so old exports still import.
     if (package.format != PACKAGE_FORMAT && package.format != LEGACY_PACKAGE_FORMAT)
         || package.version != PACKAGE_VERSION
@@ -235,6 +236,91 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
         let _ = fs::remove_dir_all(&temp_att_dir);
     }
     result
+}
+
+/// Parses one package from an already-open stream with a hard byte ceiling.
+///
+/// `take(limit + 1)` bounds what the JSON parser can consume. If the cap is
+/// exhausted, the stream was longer than declared (or grew while being read),
+/// so the import is refused even when the leading bytes form valid JSON
+/// (K-05a).
+fn parse_package_bounded<R: Read>(reader: R, limit: u64) -> Result<Package, VaultError> {
+    let mut limited = reader.take(limit.saturating_add(1));
+    let parsed = {
+        let mut deserializer =
+            serde_json::Deserializer::from_reader(std::io::BufReader::new(&mut limited));
+        Package::deserialize(&mut deserializer).and_then(|package| {
+            deserializer.end()?;
+            Ok(package)
+        })
+    };
+    // Check the cap before classifying the parse result: if `take` was
+    // exhausted, the stream was longer than the ceiling and the failure (or
+    // apparent success) must be reported as an oversized package.
+    if limited.limit() == 0 {
+        return Err(VaultError::Io("package_too_large".to_string()));
+    }
+    parsed.map_err(|_| VaultError::WrongPasswordOrCorrupt)
+}
+
+/// True only for the exact staging names `import_package` creates:
+/// `.import-<32 hex>.vault` and `.import-<32 hex>.vault.attachments`.
+fn is_import_staging_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(IMPORT_PREFIX) else {
+        return false;
+    };
+    let token = rest
+        .strip_suffix(".vault.attachments")
+        .or_else(|| rest.strip_suffix(".vault"));
+    token.is_some_and(|token| {
+        token.len() == 32 && token.chars().all(|character| character.is_ascii_hexdigit())
+    })
+}
+
+/// Removes abandoned import staging entries older than `min_age` from the
+/// managed vault directory. A crash between staging and commit leaves an
+/// encrypted vault copy and blob directory behind; startup and the next import
+/// reap them so ciphertext does not stay on disk indefinitely (N-02).
+///
+/// Only direct children matching the generated name pattern are touched, and
+/// reparse points are unlinked rather than traversed.
+pub fn cleanup_stale_imports(vault_dir: &Path, min_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(vault_dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_import_staging_name(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or_default();
+        if age < min_age {
+            continue;
+        }
+        let removed_ok = if file_type.is_symlink() {
+            fs::remove_file(entry.path())
+                .or_else(|_| fs::remove_dir(entry.path()))
+                .is_ok()
+        } else if file_type.is_dir() {
+            fs::remove_dir_all(entry.path()).is_ok()
+        } else {
+            fs::remove_file(entry.path()).is_ok()
+        };
+        if removed_ok {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -461,6 +547,82 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert!(!dir.join("dest.vault").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// K-05a: the parser itself is capped, so a stream longer than the declared
+    /// size (the file grew after the metadata check) is refused even when its
+    /// leading bytes are a valid package.
+    #[test]
+    fn package_reader_rejects_a_stream_longer_than_the_cap() {
+        let body = serde_json::json!({
+            "format": PACKAGE_FORMAT,
+            "version": 1,
+            "vault_file_name": "x.vault",
+            "vault_envelope": {},
+            "attachments": [],
+        })
+        .to_string();
+        let fits = parse_package_bounded(std::io::Cursor::new(body.clone().into_bytes()), body.len() as u64)
+            .expect("exact fit parses");
+        assert_eq!(fits.version, 1);
+
+        let limit = body.len() as u64 + 4;
+        let mut padded = body;
+        while (padded.len() as u64) <= limit + 8 {
+            padded.push(' ');
+        }
+        let error = parse_package_bounded(std::io::Cursor::new(padded.into_bytes()), limit)
+            .expect_err("over-limit stream must be rejected");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "package_too_large"),
+            "unexpected error: {error:?}"
+        );
+
+        // The same holds when the cap cuts the JSON off mid-value: a parse
+        // failure caused by the ceiling is still reported as oversized.
+        let truncated = format!(
+            "{{\"format\":\"{PACKAGE_FORMAT}\",\"version\":1,\"vault_file_name\":\"x.vault\",\
+             \"vault_envelope\":{{}},\"attachments\":[],\"padding\":\"{}\"",
+            "a".repeat(64)
+        );
+        let cut_limit = truncated.len() as u64 - 8;
+        let error = parse_package_bounded(std::io::Cursor::new(truncated.into_bytes()), cut_limit)
+            .expect_err("truncated-at-cap stream must be rejected");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "package_too_large"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// N-02: crash leftovers are age-gated, and lookalike user files are never
+    /// touched.
+    #[test]
+    fn stale_import_staging_is_reaped_and_fresh_staging_kept() {
+        let dir = std::env::temp_dir().join(format!("keevra-pkggc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let token = "0123456789abcdef0123456789abcdef";
+        let staged_vault = dir.join(format!(".import-{token}.vault"));
+        fs::write(&staged_vault, b"ciphertext").expect("stage vault");
+        let staged_blobs = dir.join(format!(".import-{token}.vault.attachments"));
+        fs::create_dir_all(&staged_blobs).expect("stage blobs");
+        fs::write(staged_blobs.join("x.bin"), b"blob").expect("blob");
+        let lookalike = dir.join(".import-not-a-token.vault");
+        fs::write(&lookalike, b"keep").expect("lookalike");
+        let real = dir.join("real.vault");
+        fs::write(&real, b"keep").expect("real");
+
+        // Fresh entries may belong to a live import and are left alone.
+        assert_eq!(cleanup_stale_imports(&dir, STALE_IMPORT_AGE), 0);
+        assert!(staged_vault.exists());
+        assert!(staged_blobs.exists());
+
+        assert_eq!(cleanup_stale_imports(&dir, Duration::ZERO), 2);
+        assert!(!staged_vault.exists());
+        assert!(!staged_blobs.exists());
+        assert!(lookalike.exists());
+        assert!(real.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
