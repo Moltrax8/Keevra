@@ -43,6 +43,8 @@ export interface AccountsApi {
   selectedAttachments: AttachmentMeta[];
   dirty: boolean;
   saveError: boolean;
+  /** The last save was refused because the vault changed on disk (KV-02). */
+  saveConflict: boolean;
   /** Monotonic counter of domain mutations; used to match saves to revisions. */
   revision: number;
   snapshot: () => DomainSnapshot;
@@ -52,6 +54,8 @@ export interface AccountsApi {
   /** Clears dirty only when the saved revision is still the latest one. */
   markSaved: (revision: number) => void;
   markSaveFailed: () => void;
+  /** Marks an external-change conflict; only reopening can resolve it. */
+  markSaveConflict: () => void;
   addAccount: (name: string, service: string) => boolean;
   deleteAccount: () => void;
   setServiceIcon: (dataUrl: string | null) => void;
@@ -83,6 +87,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
   const [revision, setRevision] = useState(0);
   const [savedRevision, setSavedRevision] = useState(0);
   const [saveError, setSaveError] = useState(false);
+  const [saveConflict, setSaveConflict] = useState(false);
   const revisionRef = useRef(0);
   const dirty = revision !== savedRevision;
 
@@ -147,11 +152,18 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     if (revisionAtSave === revisionRef.current) {
       setSavedRevision(revisionAtSave);
       setSaveError(false);
+      setSaveConflict(false);
     }
   }
 
   function markSaveFailed() {
     setSaveError(true);
+    setSaveConflict(false);
+  }
+
+  function markSaveConflict() {
+    setSaveError(true);
+    setSaveConflict(true);
   }
 
   const editing = useAccountEditing({ accounts, setAccounts, selectedAccount, commit });
@@ -224,6 +236,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     setRevision(0);
     setSavedRevision(0);
     setSaveError(false);
+    setSaveConflict(false);
   }
 
   function addAccount(name: string, service: string): boolean {
@@ -289,6 +302,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     selectedAttachments,
     dirty,
     saveError,
+    saveConflict,
     revision,
     snapshot,
     applySnapshot,
@@ -296,6 +310,7 @@ export function useAccounts(onCommit: (snapshot: DomainSnapshot) => void): Accou
     clearDomain,
     markSaved,
     markSaveFailed,
+    markSaveConflict,
     addAccount,
     deleteAccount,
     setServiceIcon,

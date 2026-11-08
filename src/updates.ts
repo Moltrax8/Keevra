@@ -19,6 +19,7 @@ export interface GitHubRelease {
   tag_name: string;
   html_url: string;
   body: string | null;
+  published_at?: string | null;
   assets: GitHubAsset[];
 }
 

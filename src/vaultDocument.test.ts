@@ -126,7 +126,11 @@ describe("migrateVaultGraph", () => {
   it("repairs malformed shapes into an empty current document", () => {
     expect(migrateVaultGraph(null)).toEqual(emptyVaultGraph());
     expect(migrateVaultGraph({ accounts: "nope", nodes: null, presets: [] })).toEqual(emptyVaultGraph());
-    expect(migrateVaultGraph({ accounts: [{ name: "no id" }] })).toEqual(emptyVaultGraph());
+    const malformed = migrateVaultGraph({ accounts: [{ name: "no id" }] });
+    expect(malformed.accounts).toEqual([]);
+    expect(malformed.extraKeys).toEqual({
+      unmigratedRecords: { accounts: [{ name: "no id" }] },
+    });
   });
 
   it("rejects documents from a newer schema instead of rewriting them", () => {
@@ -209,7 +213,32 @@ describe("migrateVaultGraph", () => {
     });
     expect(report.graph.accounts).toHaveLength(1);
     expect(report.warnings).toEqual([
-      "Skipped unreadable 1 account record(s), 1 field record(s), 1 preset field record(s), 1 attachment record(s) while opening this vault.",
+      "Skipped unreadable 1 account record(s), 1 field record(s), 1 preset field record(s), 1 attachment record(s) while opening this vault. Their raw values were kept encrypted under unmigratedRecords; nothing was deleted.",
     ]);
+  });
+
+  it("quarantines raw malformed records so the next save cannot lose them", () => {
+    const report = migrateVaultGraphReport({
+      schemaVersion: 3,
+      accounts: [
+        { id: "ok", name: "OK", service: "", tags: [], fields: [] },
+        { name: "no id" },
+        { id: "partial", name: "Partial", fields: [{ id: "f", label: "L", type: "Text", value: 42 }] },
+      ],
+      presets: [{ name: "no preset id" }],
+      attachments: [{ id: "bad" }],
+    });
+    expect(report.graph.extraKeys?.unmigratedRecords).toEqual({
+      accounts: [{ name: "no id" }],
+      fields: [{ id: "f", label: "L", type: "Text", value: 42 }],
+      presets: [{ name: "no preset id" }],
+      attachments: [{ id: "bad" }],
+    });
+    // The quarantined values survive a later load/save cycle unchanged.
+    const second = migrateVaultGraphReport(report.graph);
+    expect(second.graph.extraKeys?.unmigratedRecords).toEqual(
+      report.graph.extraKeys?.unmigratedRecords,
+    );
+    expect(second.warnings).toEqual([]);
   });
 });

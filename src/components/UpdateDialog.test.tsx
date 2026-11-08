@@ -9,6 +9,7 @@ function release(): GitHubRelease {
     tag_name: "v0.2.1",
     html_url: "https://github.com/Moltrax8/Keevra/releases/tag/v0.2.1",
     body: "### Fixed\n\n- Update dialog shows the release notes before downloading.",
+    published_at: "2026-11-07T17:31:16Z",
     assets: [],
   };
 }
@@ -39,6 +40,41 @@ describe("UpdateDialog", () => {
     );
     expect(screen.getByRole("button", { name: /Download update/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Not now" })).toBeTruthy();
+  });
+
+  it("renders structured notes with a badge, version and section cards", () => {
+    render(
+      <UpdateDialog
+        check={available()}
+        busy={false}
+        onDownload={vi.fn()}
+        onLater={vi.fn()}
+        onCopyLink={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Release notes")).toBeTruthy();
+    expect(screen.getByText("Version 0.2.1")).toBeTruthy();
+    expect(screen.getByText("What’s New")).toBeTruthy();
+    expect(screen.getByText("Released November 7, 2026")).toBeTruthy();
+    expect(screen.getByText("Bug Fixes")).toBeTruthy();
+  });
+
+  it("keeps the release link and download as separate actions", () => {
+    const onCopyLink = vi.fn();
+    render(
+      <UpdateDialog
+        check={available()}
+        busy={false}
+        onDownload={vi.fn()}
+        onLater={vi.fn()}
+        onCopyLink={onCopyLink}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Copy release link/ }));
+    expect(onCopyLink).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Full changelog and technical details")).toBeTruthy();
   });
 
   it("wires download, later and copy actions", () => {

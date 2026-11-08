@@ -170,6 +170,10 @@ export function useUpdater(): UpdaterApi {
           message.includes("not_in_manifest")
         ) {
           setStatus("VERIFICATION FAILED — file was NOT saved or installed. Treat the release as untrusted.");
+        } else if (message.includes("invalid_update_destination")) {
+          setStatus("Save the installer with an .exe file name outside the Keevra data folder.");
+        } else if (message.includes("protected_destination")) {
+          setStatus("That location belongs to Keevra. Choose a different file name or folder.");
         } else {
           setStatus("Download failed. Nothing was installed.");
         }

@@ -13,7 +13,7 @@ use std::{
     collections::HashSet,
     fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -29,6 +29,10 @@ pub const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACKAGE_ATTACHMENTS: usize = 10_000;
 /// Prefix and age gate for crash-leftover staging cleanup (N-02).
 const IMPORT_PREFIX: &str = ".import-";
+/// Marker written inside a staged attachment directory until the vault rename
+/// commits the import. A crash between the two renames leaves the directory at
+/// its final path with this marker, so cleanup can identify and reap it.
+const IMPORT_PENDING_MARKER: &str = ".import-pending";
 /// Staging entries younger than this may belong to a live import in another
 /// process, so startup GC leaves them alone.
 pub const STALE_IMPORT_AGE: Duration = Duration::from_secs(60 * 60);
@@ -213,6 +217,11 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
             for (id, blob_text) in &blobs {
                 write_atomic(&temp_att_dir.join(format!("{id}.bin")), blob_text)?;
             }
+            // Mark the directory as import-owned until the vault rename below
+            // commits it. If the process dies in between, the directory has
+            // already been moved to its final path but no vault references it;
+            // cleanup uses this marker to reap it (N-02).
+            write_atomic(&temp_att_dir.join(IMPORT_PENDING_MARKER), "")?;
         }
         let mut attachments_committed = false;
         if !blobs.is_empty() {
@@ -224,6 +233,12 @@ pub fn import_package(source_path: &Path, dest_vault_path: &Path) -> Result<Impo
                 let _ = fs::remove_dir_all(&final_att_dir);
             }
             return Err(VaultError::Io(error.to_string()));
+        }
+        // The vault file now exists, so the attachments directory is live.
+        // Dropping the marker is best effort; cleanup removes it later if the
+        // process dies here.
+        if attachments_committed {
+            let _ = fs::remove_file(final_att_dir.join(IMPORT_PENDING_MARKER));
         }
         Ok(ImportedPackage {
             vault_path: dest_vault_path.to_string_lossy().to_string(),
@@ -277,13 +292,20 @@ fn is_import_staging_name(name: &str) -> bool {
     })
 }
 
-/// Removes abandoned import staging entries older than `min_age` from the
-/// managed vault directory. A crash between staging and commit leaves an
-/// encrypted vault copy and blob directory behind; startup and the next import
-/// reap them so ciphertext does not stay on disk indefinitely (N-02).
+/// Removes abandoned import leftovers older than `min_age` from the managed
+/// vault directory. Two crash windows are covered (N-02):
 ///
-/// Only direct children matching the generated name pattern are touched, and
-/// reparse points are unlinked rather than traversed.
+/// 1. A crash between staging and the first rename leaves `.import-<token>`
+///    entries (encrypted vault copy and blob directory).
+/// 2. A crash between the blob-directory rename and the vault rename leaves
+///    the attachment directory at its **final** path (`<vault>.attachments`)
+///    with no vault file beside it. That directory still carries
+///    [`IMPORT_PENDING_MARKER`], which is what makes it eligible; an orphan
+///    directory without the marker is treated as user data and kept.
+///
+/// Only direct children matching the generated name pattern (or a marked
+/// `.attachments` directory) are touched, and reparse points are unlinked
+/// rather than traversed.
 pub fn cleanup_stale_imports(vault_dir: &Path, min_age: Duration) -> usize {
     let Ok(entries) = fs::read_dir(vault_dir) else {
         return 0;
@@ -292,35 +314,77 @@ pub fn cleanup_stale_imports(vault_dir: &Path, min_age: Duration) -> usize {
     let mut removed = 0;
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !is_import_staging_name(&name) {
-            continue;
-        }
+        let staging = is_import_staging_name(&name);
+        let orphan_vault = if staging {
+            None
+        } else {
+            match orphan_attachment_vault(vault_dir, &name) {
+                Some(path) => Some(path),
+                None => continue,
+            }
+        };
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        let age = entry
+        let Some(age) = entry
             .metadata()
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
-            .unwrap_or_default();
+        else {
+            continue;
+        };
         if age < min_age {
             continue;
         }
-        let removed_ok = if file_type.is_symlink() {
-            fs::remove_file(entry.path())
-                .or_else(|_| fs::remove_dir(entry.path()))
-                .is_ok()
-        } else if file_type.is_dir() {
-            fs::remove_dir_all(entry.path()).is_ok()
-        } else {
-            fs::remove_file(entry.path()).is_ok()
+
+        if staging {
+            let removed_ok = if file_type.is_symlink() {
+                fs::remove_file(entry.path())
+                    .or_else(|_| fs::remove_dir(entry.path()))
+                    .is_ok()
+            } else if file_type.is_dir() {
+                fs::remove_dir_all(entry.path()).is_ok()
+            } else {
+                fs::remove_file(entry.path()).is_ok()
+            };
+            if removed_ok {
+                removed += 1;
+            }
+            continue;
+        }
+
+        // Orphan `.attachments` directory: only a real directory carrying the
+        // import marker qualifies, and only when its vault file is absent.
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let marker = entry.path().join(IMPORT_PENDING_MARKER);
+        if !marker.is_file() {
+            continue;
+        }
+        let Some(vault_path) = orphan_vault else {
+            continue;
         };
-        if removed_ok {
+        if vault_path.exists() {
+            // The import committed and only the marker was left behind.
+            let _ = fs::remove_file(&marker);
+            continue;
+        }
+        if fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
         }
     }
     removed
+}
+
+/// `<name>.attachments` -> `<vault_dir>/<name>`; `None` for other names.
+fn orphan_attachment_vault(vault_dir: &Path, name: &str) -> Option<PathBuf> {
+    let vault_name = name.strip_suffix(".attachments")?;
+    if vault_name.is_empty() {
+        return None;
+    }
+    Some(vault_dir.join(vault_name))
 }
 
 #[cfg(test)]
@@ -392,6 +456,10 @@ mod tests {
         let imported = import_package(&dest, &restored).expect("import");
         assert_eq!(imported.attachment_count, 1);
         assert!(crate::attachments::attachments_dir(&restored).join("x.bin").exists());
+        // A committed import drops the interrupted-import marker.
+        assert!(!crate::attachments::attachments_dir(&restored)
+            .join(IMPORT_PENDING_MARKER)
+            .exists());
         assert!(import_package(&dest, &restored).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -623,6 +691,47 @@ mod tests {
         assert!(!staged_blobs.exists());
         assert!(lookalike.exists());
         assert!(real.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// N-02 follow-up: a crash after the attachment directory reached its
+    /// final path but before the vault file appeared leaves it orphaned. The
+    /// import marker makes it reapable; lookalikes and completed imports are
+    /// left intact.
+    #[test]
+    fn interrupted_import_orphan_attachments_are_reaped() {
+        let dir = std::env::temp_dir().join(format!("keevra-pkgorphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+
+        // Crash window: blobs + marker at the final path, no vault file.
+        let orphan = dir.join("dest.vault.attachments");
+        fs::create_dir_all(&orphan).expect("orphan");
+        fs::write(orphan.join("x.bin"), b"blob").expect("blob");
+        fs::write(orphan.join(IMPORT_PENDING_MARKER), b"").expect("marker");
+
+        // No marker means the directory is not provably import-owned; keep it.
+        let lookalike = dir.join("other.vault.attachments");
+        fs::create_dir_all(&lookalike).expect("lookalike");
+        fs::write(lookalike.join("x.bin"), b"blob").expect("blob");
+
+        // A completed import keeps its directory and only loses the marker.
+        let committed = dir.join("done.vault");
+        fs::write(&committed, b"ciphertext").expect("vault");
+        let committed_blobs = dir.join("done.vault.attachments");
+        fs::create_dir_all(&committed_blobs).expect("committed");
+        fs::write(committed_blobs.join("x.bin"), b"blob").expect("blob");
+        fs::write(committed_blobs.join(IMPORT_PENDING_MARKER), b"").expect("marker");
+
+        // Fresh entries may belong to a live import.
+        assert_eq!(cleanup_stale_imports(&dir, STALE_IMPORT_AGE), 0);
+        assert!(orphan.exists());
+
+        assert_eq!(cleanup_stale_imports(&dir, Duration::ZERO), 1);
+        assert!(!orphan.exists());
+        assert!(lookalike.exists());
+        assert!(committed_blobs.exists());
+        assert!(!committed_blobs.join(IMPORT_PENDING_MARKER).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

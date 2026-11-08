@@ -40,6 +40,9 @@ function describeAttachmentError(error: unknown): string {
   if (message.includes("vault_changed")) {
     return "The vault changed while the file dialog was open. Try again.";
   }
+  if (message.includes("protected_destination")) {
+    return "That location belongs to Keevra. Choose a different file name or folder.";
+  }
   if (message.includes("vault_locked")) return "Vault is locked.";
   return "Attachment operation failed.";
 }

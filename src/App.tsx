@@ -38,9 +38,23 @@ function App() {
   // Saves are strictly serialized: an auto-save, a lock flush and a package
   // export can otherwise overlap and race on the same vault file.
   const saveQueue = useRef<Promise<boolean>>(Promise.resolve(true));
+  // The path/generation the in-memory document belongs to, captured when a
+  // save is requested. A queued save therefore carries the session it was
+  // prepared for and the backend refuses it after a vault switch (KV-04).
+  const saveTarget = useRef<{ path: string; generation: number | null }>({
+    path: "",
+    generation: null,
+  });
 
   const doPersist = useEffectEvent(async (): Promise<boolean> => {
     const revision = accounts.revision;
+    const target = saveTarget.current;
+    if (target.path === "" || target.generation === null) {
+      accounts.markSaveFailed();
+      return false;
+    }
+    const expectedPath = target.path;
+    const expectedGeneration = target.generation;
     const document: VaultGraph = {
       ...accounts.extraKeys,
       accounts: accounts.accounts,
@@ -52,11 +66,13 @@ function App() {
     const retained = retainedAttachmentIds(accounts.snapshot(), history.history);
     const run = saveQueue.current.then(async () => {
       try {
-        await vaultSave(document, retained);
+        await vaultSave(document, retained, expectedPath, expectedGeneration);
         accounts.markSaved(revision);
         return true;
-      } catch {
-        accounts.markSaveFailed();
+      } catch (error) {
+        const message = typeof error === "string" ? error : "";
+        if (message.includes("vault_conflict")) accounts.markSaveConflict();
+        else accounts.markSaveFailed();
         return false;
       }
     });
@@ -97,6 +113,12 @@ function App() {
     applyVaultDocument,
     onLocked,
   });
+  // Keep the save binding in step with the session state that owns the
+  // document currently in `accounts`.
+  saveTarget.current = {
+    path: session.vaultPath,
+    generation: session.vaultGeneration,
+  };
 
   const updater = useUpdater();
 
@@ -272,7 +294,19 @@ function App() {
         <div className="topbar-spacer" />
         {vaultActive ? (
           <>
-            {accounts.saveError ? (
+            {accounts.saveConflict ? (
+              <span className="save-state save-state--error">
+                <AlertTriangle style={{ width: 14, height: 14 }} /> Changed on disk
+                <button
+                  type="button"
+                  className="mini-btn"
+                  title="Discard unsaved edits, lock, and load the newest file on unlock"
+                  onClick={() => void session.handleVaultReloadExternal()}
+                >
+                  Discard &amp; reload
+                </button>
+              </span>
+            ) : accounts.saveError ? (
               <span className="save-state save-state--error">
                 <AlertTriangle style={{ width: 14, height: 14 }} /> Save failed
                 <button type="button" className="mini-btn" onClick={() => void doPersist()}>

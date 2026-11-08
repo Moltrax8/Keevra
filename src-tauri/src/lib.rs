@@ -40,6 +40,10 @@ struct VaultSession {
     /// with the vault path; a write that arrives after a lock/open/switch is
     /// refused before it can touch the wrong vault (K-03).
     generation: u64,
+    /// SHA-256 of the vault file when it was opened (and after every save).
+    /// A save refuses to overwrite a file that no longer matches it, so an
+    /// external writer cannot be silently rolled back (KV-02).
+    fingerprint: [u8; 32],
     last_touch: Instant,
 }
 
@@ -121,10 +125,23 @@ fn guarded_session(
     expected_generation: u64,
 ) -> Result<(Zeroizing<[u8; 32]>, PathBuf), VaultError> {
     let (key, _, _, path, generation) = session_path(state)?;
+    verify_session_target(&path, generation, expected_path, expected_generation)?;
+    Ok((key, path))
+}
+
+/// Refuses work that was prepared for a different vault session. Used by every
+/// write command, including `vault_save`, so a document snapshot can never be
+/// encrypted into a vault other than the one it came from (KV-04).
+fn verify_session_target(
+    path: &Path,
+    generation: u64,
+    expected_path: &str,
+    expected_generation: u64,
+) -> Result<(), VaultError> {
     if generation != expected_generation || path.to_string_lossy() != expected_path {
         return Err(VaultError::Io("vault_changed".to_string()));
     }
-    Ok((key, path))
+    Ok(())
 }
 
 #[tauri::command]
@@ -169,7 +186,15 @@ fn vault_touch(state: State<VaultState>) -> Result<(), String> {
 fn vault_get_document(state: State<VaultState>) -> Result<GraphData, String> {
     let (key, _, _, path, _) = session_path(&state).map_err(String::from)?;
     let contents = vault::read_vault_file(&path).map_err(String::from)?;
-    vault::open_envelope_with_key(&contents, &key).map_err(String::from)
+    let graph = vault::open_envelope_with_key(&contents, &key).map_err(String::from)?;
+    // This was a legitimate external update if it still opens with our key:
+    // bind the next save to what we just read.
+    let fingerprint = vault::fingerprint_bytes(contents.as_bytes());
+    let mut guard = lock_session(&state);
+    if let Some(session) = guard.as_mut().filter(|session| session.path == path) {
+        session.fingerprint = fingerprint;
+    }
+    Ok(graph)
 }
 
 #[tauri::command]
@@ -185,6 +210,13 @@ fn vault_list(app: AppHandle) -> Result<Vec<registry::VaultEntry>, String> {
 struct CreatedVault {
     graph: GraphData,
     path: String,
+    generation: u64,
+}
+
+#[derive(serde::Serialize)]
+struct OpenedVault {
+    graph: GraphData,
+    generation: u64,
 }
 
 #[tauri::command]
@@ -210,25 +242,30 @@ fn vault_create(
     let guarded_password = Zeroizing::new(password);
     let (graph, salt, key, kdf) =
         vault::create_vault(&vault_path, guarded_password.as_bytes()).map_err(String::from)?;
+    let fingerprint = vault::fingerprint_file(&vault_path).map_err(String::from)?;
     let path_string = vault_path.to_string_lossy().to_string();
-    registry::remember_vault(
+    // A failed registry write must not leave an unlisted, unreachable vault on
+    // disk (KV-06). Roll back everything this command just created.
+    remember_or_rollback(
         &registry::registry_path(&dir),
         name.trim(),
-        &path_string,
+        &vault_path,
         hint.as_deref(),
-    )
-    .map_err(String::from)?;
+    )?;
+    let generation = next_session_generation();
     lock_session(&state).replace(VaultSession {
         key,
         salt,
         kdf,
         path: vault_path,
-        generation: next_session_generation(),
+        generation,
+        fingerprint,
         last_touch: Instant::now(),
     });
     Ok(CreatedVault {
         graph,
         path: path_string,
+        generation,
     })
 }
 
@@ -434,6 +471,23 @@ fn remove_if_exists(path: &std::path::Path, failures: &mut Vec<String>) {
     }
 }
 
+/// Writes the registry entry for a vault this command just created, and removes
+/// the vault (plus its blobs/backups) if that write fails. Without this, a full
+/// disk or a corrupt/unwritable `vaults.json` leaves an encrypted file the UI
+/// never shows and the user cannot open (KV-06).
+fn remember_or_rollback(
+    registry: &Path,
+    name: &str,
+    vault_path: &Path,
+    hint: Option<&str>,
+) -> Result<Vec<registry::VaultEntry>, String> {
+    let path_string = vault_path.to_string_lossy().to_string();
+    registry::remember_vault(registry, name, &path_string, hint).map_err(|error| {
+        let _ = remove_managed_vault_files(vault_path);
+        error.to_string()
+    })
+}
+
 /// A deleted default stops being the default.
 fn clear_default_if_matches(dir: &std::path::Path, path: &str) -> Result<(), String> {
     let settings_path = registry::settings_path(dir);
@@ -452,21 +506,24 @@ fn vault_open(
     state: State<VaultState>,
     path: String,
     password: String,
-) -> Result<GraphData, String> {
+) -> Result<OpenedVault, String> {
     let guarded_password = Zeroizing::new(password);
     let vault_path = PathBuf::from(&path);
     let contents = vault::read_vault_file(&vault_path).map_err(String::from)?;
     let (graph, salt, key, kdf) =
         vault::open_graph(&contents, guarded_password.as_bytes()).map_err(String::from)?;
+    let fingerprint = vault::fingerprint_bytes(contents.as_bytes());
+    let generation = next_session_generation();
     lock_session(&state).replace(VaultSession {
         key,
         salt,
         kdf,
         path: vault_path,
-        generation: next_session_generation(),
+        generation,
+        fingerprint,
         last_touch: Instant::now(),
     });
-    Ok(graph)
+    Ok(OpenedVault { graph, generation })
 }
 
 #[tauri::command]
@@ -474,9 +531,42 @@ fn vault_save(
     state: State<VaultState>,
     graph: GraphData,
     retain_attachment_ids: Vec<String>,
+    expected_path: String,
+    expected_generation: u64,
 ) -> Result<(), String> {
-    let (key, salt, kdf, path, _) = session_path(&state).map_err(String::from)?;
-    vault::save_vault(&path, &graph, &key, &salt, kdf).map_err(String::from)?;
+    // The session identity and the external-change fingerprint are validated
+    // while the session lock is held, and the file write happens in the same
+    // critical section. A snapshot prepared for vault A can therefore never be
+    // encrypted into vault B (KV-04), and an external writer that changed the
+    // file after open is refused instead of overwritten (KV-02).
+    let (key, path) = {
+        let mut guard = lock_session(&state);
+        if expire_idle_session(&mut guard) {
+            return Err(VaultError::Io("vault_locked".to_string()).to_string());
+        }
+        let Some(session) = guard.as_mut() else {
+            return Err(VaultError::Io("vault_locked".to_string()).to_string());
+        };
+        verify_session_target(
+            &session.path,
+            session.generation,
+            &expected_path,
+            expected_generation,
+        )
+        .map_err(String::from)?;
+        session.last_touch = Instant::now();
+        let fingerprint = vault::save_vault_checked(
+            &session.path,
+            &graph,
+            &session.key,
+            &session.salt,
+            session.kdf,
+            &session.fingerprint,
+        )
+        .map_err(String::from)?;
+        session.fingerprint = fingerprint;
+        (session.key.clone(), session.path.clone())
+    };
     // Best-effort orphan sweep: keep blobs referenced by the new document,
     // the verified backup (restore must never miss blobs), plus any the UI
     // retains for undo/redo history. Sweep failures never fail the save.
@@ -542,6 +632,76 @@ fn vault_restore_backup(
     vault::restore_backup(&vault_path, guarded_password.as_bytes()).map_err(String::from)
 }
 
+/// Validates a user-chosen export path against Keevra-owned state before any
+/// plaintext or package bytes are written (KV-01). Registered vaults are read
+/// best-effort: a corrupt registry must not block an otherwise safe export,
+/// while the known registry/settings files and app vault directory are always
+/// protected.
+fn guarded_export_destination(
+    app: &AppHandle,
+    state: &State<VaultState>,
+    dest: &str,
+) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| VaultError::Io(e.to_string()))
+        .map_err(String::from)?;
+    let registry_path = registry::registry_path(&dir);
+    let mut protected = vec![registry_path.clone(), registry::settings_path(&dir)];
+    if let Ok((_, _, _, path, _)) = session_path(state) {
+        protected.push(path);
+    }
+    if let Ok(entries) = registry::read_registry(&registry_path) {
+        protected.extend(entries.into_iter().map(|entry| PathBuf::from(entry.path)));
+    }
+    let protected_dirs = vec![registry::vaults_dir(&dir)];
+    let dest_path = PathBuf::from(dest);
+    vault::ensure_export_destination(&dest_path, &protected, &protected_dirs)
+        .map_err(String::from)?;
+    Ok(dest_path)
+}
+
+/// Update installers must be `.exe` files outside the app data directory; the
+/// shared protected-target guard covers vaults and blobs. A non-installer
+/// extension is refused so a verified-download command cannot be used as a
+/// generic file drop.
+fn is_update_installer_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
+/// Update installers may only be written as `.exe` files outside the app's own
+/// data directory; the shared protected-target guard covers vaults and blobs.
+fn guarded_update_destination(app: &AppHandle, dest: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| VaultError::Io(e.to_string()))
+        .map_err(String::from)?;
+    let registry_path = registry::registry_path(&dir);
+    let mut protected = vec![registry_path.clone(), registry::settings_path(&dir)];
+    if let Ok(entries) = registry::read_registry(&registry_path) {
+        protected.extend(entries.into_iter().map(|entry| PathBuf::from(entry.path)));
+    }
+    // Also cover an open vault that is not listed (external path opened via
+    // the picker), even though the UI normally only opens registered vaults.
+    if let Some(state) = app.try_state::<VaultState>() {
+        if let Ok((_, _, _, path, _)) = session_path(&state) {
+            protected.push(path);
+        }
+    }
+    let dest_path = PathBuf::from(dest);
+    if !is_update_installer_path(&dest_path) {
+        return Err(VaultError::Io("invalid_update_destination".to_string()).to_string());
+    }
+    let protected_dirs = vec![dir.clone(), registry::vaults_dir(&dir)];
+    vault::ensure_export_destination(&dest_path, &protected, &protected_dirs)
+        .map_err(String::from)?;
+    Ok(dest_path)
+}
+
 #[tauri::command]
 fn attachment_import(
     state: State<VaultState>,
@@ -559,6 +719,7 @@ fn attachment_import(
 
 #[tauri::command]
 fn attachment_export(
+    app: AppHandle,
     state: State<VaultState>,
     attachment_id: String,
     expected_sha256: String,
@@ -568,7 +729,8 @@ fn attachment_export(
 ) -> Result<u64, String> {
     let (key, path) =
         guarded_session(&state, &expected_path, expected_generation).map_err(String::from)?;
-    attachments::attachment_export(&key, &path, &attachment_id, &expected_sha256, &PathBuf::from(dest_path))
+    let dest = guarded_export_destination(&app, &state, &dest_path)?;
+    attachments::attachment_export(&key, &path, &attachment_id, &expected_sha256, &dest)
         .map_err(String::from)
 }
 
@@ -583,9 +745,14 @@ fn attachment_read(
 }
 
 #[tauri::command]
-fn vault_export_package(state: State<VaultState>, dest_path: String) -> Result<usize, String> {
+fn vault_export_package(
+    app: AppHandle,
+    state: State<VaultState>,
+    dest_path: String,
+) -> Result<usize, String> {
+    let dest = guarded_export_destination(&app, &state, &dest_path)?;
     let (key, _, _, path, _) = session_path(&state).map_err(String::from)?;
-    package::export_package(&path, &PathBuf::from(dest_path), Some(&key)).map_err(String::from)
+    package::export_package(&path, &dest, Some(&key)).map_err(String::from)
 }
 
 #[tauri::command]
@@ -610,9 +777,10 @@ fn vault_import_package(
     );
     let dest = registry::vaults_dir(&dir).join(registry::random_vault_filename());
     package::import_package(&PathBuf::from(&source_path), &dest).map_err(String::from)?;
-    let dest_string = dest.to_string_lossy().to_string();
-    registry::remember_vault(&registry::registry_path(&dir), &name, &dest_string, None)
-        .map_err(String::from)
+    // A failed registry write removes the freshly imported vault and its
+    // attachment directory instead of leaving unreachable ciphertext behind
+    // (KV-06).
+    remember_or_rollback(&registry::registry_path(&dir), &name, &dest, None)
 }
 
 #[derive(serde::Serialize)]
@@ -644,18 +812,23 @@ struct ManifestDownload {
 /// SHA download. Downgrades and unlisted assets are refused.
 #[tauri::command]
 async fn update_download_manifest_asset(
+    app: AppHandle,
     installer_url: String,
     manifest_json: String,
     manifest_sig: String,
     current_version: String,
     dest_path: String,
 ) -> Result<ManifestDownload, String> {
+    // A verified installer must never be written over a vault, backup, blob,
+    // registry file or app data (KV-01). Only `.exe` targets outside the app
+    // directory are accepted.
+    let dest = guarded_update_destination(&app, &dest_path)?;
     let (bytes, version) = updates::download_manifest_asset(
         &installer_url,
         &manifest_json,
         &manifest_sig,
         &current_version,
-        &PathBuf::from(dest_path),
+        &dest,
     )
     .await
     .map_err(String::from)?;
@@ -750,6 +923,7 @@ mod tests {
             kdf: KdfCost::default(),
             path: PathBuf::from("test.vault"),
             generation: 1,
+            fingerprint: [0u8; 32],
             last_touch,
         };
 
@@ -797,6 +971,66 @@ mod tests {
 
         // A user retry must be idempotent, not an error.
         remove_managed_vault_files(&vault_path).expect("second cleanup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// KV-04: a save prepared for one session generation/path must be refused
+    /// before it can touch another vault.
+    #[test]
+    fn save_target_requires_the_same_path_and_generation() {
+        let path = PathBuf::from("A.vault");
+        assert!(verify_session_target(&path, 7, "A.vault", 7).is_ok());
+        assert!(matches!(
+            verify_session_target(&path, 7, "B.vault", 7),
+            Err(VaultError::Io(ref message)) if message == "vault_changed"
+        ));
+        assert!(matches!(
+            verify_session_target(&path, 7, "A.vault", 8),
+            Err(VaultError::Io(ref message)) if message == "vault_changed"
+        ));
+    }
+
+    /// KV-01: only a `.exe` destination can receive a verified installer.
+    #[test]
+    fn update_destination_requires_an_exe_name() {
+        assert!(is_update_installer_path(&PathBuf::from(
+            "C:\\Users\\me\\Downloads\\Keevra_0.2.3_x64-setup.exe"
+        )));
+        assert!(is_update_installer_path(&PathBuf::from("setup.EXE")));
+        for rejected in [
+            "updates.json",
+            "Keevra_0.2.3_x64-setup.exe.txt",
+            "setup",
+            "setup.bat",
+            ".exe",
+        ] {
+            assert!(
+                !is_update_installer_path(&PathBuf::from(rejected)),
+                "accepted non-installer: {rejected}"
+            );
+        }
+    }
+
+    /// KV-06: when the registry cannot be written, the just-created vault and
+    /// its attachment directory are removed instead of being left unreachable.
+    #[test]
+    fn registry_failure_rolls_back_created_vault() {
+        let dir = unique_dir("registry-rollback");
+        let vault_path = dir.join("new.vault");
+        std::fs::write(&vault_path, b"ciphertext").expect("vault");
+        let blobs = attachments::attachments_dir(&vault_path);
+        std::fs::create_dir_all(&blobs).expect("blobs");
+        std::fs::write(blobs.join("a.bin"), b"blob").expect("blob");
+
+        // A directory at `vaults.json` makes every registry write fail.
+        let registry = dir.join("vaults.json");
+        std::fs::create_dir(&registry).expect("registry blocker");
+
+        let error = remember_or_rollback(&registry, "New", &vault_path, None)
+            .expect_err("registry write must fail");
+        assert!(!error.is_empty());
+        assert!(!vault_path.exists(), "vault left behind");
+        assert!(!blobs.exists(), "blob directory left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

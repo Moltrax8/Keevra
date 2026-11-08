@@ -47,6 +47,33 @@ export interface MigrationReport {
   warnings: string[];
 }
 
+/**
+ * Raw records this build could not understand, kept in the encrypted vault
+ * under `extraKeys.unmigratedRecords` instead of being discarded. A later
+ * version (or a manual recovery) can still read the original shape (KV-05).
+ */
+export interface UnmigratedRecords {
+  accounts?: unknown[];
+  presets?: unknown[];
+  fields?: unknown[];
+  presetFields?: unknown[];
+  attachments?: unknown[];
+}
+
+function emptyUnmigrated(): UnmigratedRecords {
+  return {};
+}
+
+function quarantine(
+  bucket: keyof UnmigratedRecords,
+  value: unknown,
+  dropped: UnmigratedRecords,
+): void {
+  const values = dropped[bucket] ?? [];
+  values.push(value);
+  dropped[bucket] = values;
+}
+
 /** Keys consumed by the current or legacy schema; everything else is kept. */
 const KNOWN_TOP_LEVEL_KEYS = new Set([
   "accounts",
@@ -129,7 +156,11 @@ function withPreserved<T extends object>(
   return extra === undefined ? base : { ...base, extraKeys: extra };
 }
 
-function asFields(value: unknown, counts: MigrationCounts): Field[] {
+function asFields(
+  value: unknown,
+  counts: MigrationCounts,
+  dropped: UnmigratedRecords,
+): Field[] {
   const source = asArray(value);
   const fields = source.flatMap((entry): Field[] => {
     const field = asRecord(entry);
@@ -140,6 +171,7 @@ function asFields(value: unknown, counts: MigrationCounts): Field[] {
       typeof field.type !== "string" ||
       typeof field.value !== "string"
     ) {
+      quarantine("fields", entry, dropped);
       return [];
     }
     return [
@@ -158,11 +190,16 @@ function asTags(value: unknown): string[] {
   return asArray(value).filter((tag): tag is string => typeof tag === "string");
 }
 
-function asBlueprintFields(value: unknown, counts: MigrationCounts): PresetFieldBlueprint[] {
+function asBlueprintFields(
+  value: unknown,
+  counts: MigrationCounts,
+  dropped: UnmigratedRecords,
+): PresetFieldBlueprint[] {
   const source = asArray(value);
   const fields = source.flatMap((entry): PresetFieldBlueprint[] => {
     const field = asRecord(entry);
     if (field === null || typeof field.label !== "string" || typeof field.type !== "string") {
+      quarantine("presetFields", entry, dropped);
       return [];
     }
     return [
@@ -180,16 +217,19 @@ function asBlueprintFields(value: unknown, counts: MigrationCounts): PresetField
 function asAccount(
   value: unknown,
   counts: MigrationCounts,
+  dropped: UnmigratedRecords,
   consumedKeys: readonly string[] = [],
 ): Account | null {
   const account = asRecord(value);
   if (account === null) {
     counts.accounts += 1;
+    quarantine("accounts", value, dropped);
     return null;
   }
   const id = asString(account.id);
   if (id.trim() === "") {
     counts.accounts += 1;
+    quarantine("accounts", value, dropped);
     return null;
   }
   return withPreserved(
@@ -198,7 +238,7 @@ function asAccount(
       name: asString(account.name, id),
       service: asString(account.service),
       tags: asTags(account.tags),
-      fields: asFields(account.fields, counts),
+      fields: asFields(account.fields, counts, dropped),
     },
     account,
     ["id", "name", "service", "tags", "fields", ...consumedKeys],
@@ -208,16 +248,19 @@ function asAccount(
 function asPreset(
   value: unknown,
   counts: MigrationCounts,
+  dropped: UnmigratedRecords,
   consumedKeys: readonly string[] = [],
 ): AccountPreset | null {
   const preset = asRecord(value);
   if (preset === null) {
     counts.presets += 1;
+    quarantine("presets", value, dropped);
     return null;
   }
   const id = asString(preset.id);
   if (id.trim() === "") {
     counts.presets += 1;
+    quarantine("presets", value, dropped);
     return null;
   }
   return withPreserved(
@@ -226,7 +269,7 @@ function asPreset(
       name: asString(preset.name, id),
       service: asString(preset.service),
       tags: asTags(preset.tags),
-      fields: asBlueprintFields(preset.fields, counts),
+      fields: asBlueprintFields(preset.fields, counts, dropped),
     },
     preset,
     ["id", "name", "service", "tags", "fields", ...consumedKeys],
@@ -243,7 +286,11 @@ function asPreset(
  * Relationships, layout and custom type definitions have no equivalent and
  * are discarded; every node's fields and name survive.
  */
-function accountsFromNodes(document: Record<string, unknown>, counts: MigrationCounts): Account[] {
+function accountsFromNodes(
+  document: Record<string, unknown>,
+  counts: MigrationCounts,
+  dropped: UnmigratedRecords,
+): Account[] {
   const nodes = asArray(document.nodes).map(asRecord).filter((node): node is Record<string, unknown> => node !== null);
   const relationships = asArray(document.relationships)
     .map(asRecord)
@@ -262,7 +309,7 @@ function accountsFromNodes(document: Record<string, unknown>, counts: MigrationC
   const accounts: Account[] = [];
   for (const node of nodes) {
     // `type` is a legacy graph key consumed by the migration, not unknown data.
-    const account = asAccount(node, counts, ["type"]);
+    const account = asAccount(node, counts, dropped, ["type"]);
     if (account === null) continue;
     // A pure service container is migrated into its children, not dropped as
     // malformed data.
@@ -280,7 +327,29 @@ function summarizeSkipped(counts: MigrationCounts): string[] {
   if (counts.presetFields > 0) parts.push(`${counts.presetFields} preset field record(s)`);
   if (counts.attachments > 0) parts.push(`${counts.attachments} attachment record(s)`);
   if (counts.serviceIcons > 0) parts.push(`${counts.serviceIcons} service picture record(s)`);
-  return parts.length === 0 ? [] : [`Skipped unreadable ${parts.join(", ")} while opening this vault.`];
+  return parts.length === 0
+    ? []
+    : [
+        `Skipped unreadable ${parts.join(", ")} while opening this vault. ` +
+          "Their raw values were kept encrypted under unmigratedRecords; nothing was deleted.",
+      ];
+}
+
+/**
+ * Appends this migration's dropped records to records quarantined by an
+ * earlier load. Returns null when there is nothing to store.
+ */
+function mergeUnmigrated(
+  existing: Record<string, unknown> | null,
+  dropped: UnmigratedRecords,
+): Record<string, unknown> | null {
+  const merged: Record<string, unknown> = { ...(existing ?? {}) };
+  for (const [key, values] of Object.entries(dropped)) {
+    if (values === undefined || values.length === 0) continue;
+    const previous = Array.isArray(merged[key]) ? (merged[key] as unknown[]) : [];
+    merged[key] = [...previous, ...values];
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
 }
 
 /**
@@ -304,22 +373,30 @@ export function migrateVaultGraphReport(stored: unknown): MigrationReport {
     attachments: 0,
     serviceIcons: 0,
   };
+  const dropped = emptyUnmigrated();
 
   const accounts = Array.isArray(document.accounts)
     ? asArray(document.accounts)
-        .map((entry) => asAccount(entry, counts))
+        .map((entry) => asAccount(entry, counts, dropped))
         .filter((account): account is Account => account !== null)
-    : accountsFromNodes(document, counts);
+    : accountsFromNodes(document, counts, dropped);
 
   const presetSource = Array.isArray(document.presets) ? document.presets : document.templates;
   const presetConsumedKeys = Array.isArray(document.presets) ? [] : ["nodeType"];
   const presets = asArray(presetSource)
-    .map((entry) => asPreset(entry, counts, presetConsumedKeys))
+    .map((entry) => asPreset(entry, counts, dropped, presetConsumedKeys))
     .filter((preset): preset is AccountPreset => preset !== null);
 
   const attachmentSource = asArray(document.attachments);
-  const attachments = attachmentSource.filter(isAttachmentMeta);
-  counts.attachments += attachmentSource.length - attachments.length;
+  const attachments: AttachmentMeta[] = [];
+  for (const entry of attachmentSource) {
+    if (isAttachmentMeta(entry)) {
+      attachments.push(entry);
+    } else {
+      counts.attachments += 1;
+      quarantine("attachments", entry, dropped);
+    }
+  }
 
   const serviceIcons = normalizeServiceIcons(document.serviceIcons);
   const iconSource = asRecord(document.serviceIcons);
@@ -333,6 +410,11 @@ export function migrateVaultGraphReport(stored: unknown): MigrationReport {
   for (const [key, value] of Object.entries(document)) {
     if (!KNOWN_TOP_LEVEL_KEYS.has(key)) extraKeys[key] = value;
   }
+  // Malformed records are quarantined instead of being lost on the next save
+  // (KV-05). Existing entries from an earlier load are appended to, never
+  // replaced, so repeated migration cannot drop an older raw value.
+  const merged = mergeUnmigrated(asRecord(extraKeys.unmigratedRecords), dropped);
+  if (merged !== null) extraKeys.unmigratedRecords = merged;
   // The legacy graph is not converted 1:1, but it must never vanish silently:
   // keep the original sections encrypted alongside the v3 document so a user
   // can still recover relationship/layout data.

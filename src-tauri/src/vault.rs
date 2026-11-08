@@ -13,11 +13,13 @@ use chacha20poly1305::{
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs, io,
     io::Read as _,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
+    time::Duration,
 };
 use zeroize::Zeroizing;
 
@@ -498,15 +500,118 @@ pub(crate) fn vault_write_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn rotate_backups(path: &Path) -> Result<(), VaultError> {
-    // Oldest first so `.bak` -> `.bak.1` never clobbers `.bak.1` before it
-    // has been moved to `.bak.2`.
+/// How long a save waits for another Keevra process to release the vault file
+/// before reporting `vault_conflict`.
+const VAULT_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Opens the live vault with an OS-level writer lock held until the returned
+/// handle is dropped (KV-02).
+///
+/// The process-wide mutex only serializes threads in one process. A second
+/// Keevra process could otherwise read the same fingerprint, pass the check and
+/// overwrite the first process's save. On Windows the share mode denies other
+/// writers while still allowing readers and the final replace-on-rename, so the
+/// whole read/compare/rotate/replace sequence is one critical section across
+/// processes. Contention is retried briefly and then reported as a conflict,
+/// which the caller resolves by reopening the vault.
+#[cfg(windows)]
+fn lock_vault_for_write(path: &Path) -> Result<fs::File, VaultError> {
+    lock_vault_for_write_within(path, VAULT_LOCK_WAIT)
+}
+
+#[cfg(windows)]
+fn lock_vault_for_write_within(path: &Path, wait: Duration) -> Result<fs::File, VaultError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Share read + delete, deny write: readers keep working and the atomic
+    // temp-file rename can replace the file while this handle is still open.
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+        {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(VaultError::NotFound);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(VaultError::Io("vault_conflict".to_string()));
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(error) => return Err(VaultError::Io(error.to_string())),
+        }
+    }
+}
+
+/// Non-Windows fallback: the desktop app targets Windows, and this build has no
+/// portable advisory-lock dependency. The in-process guard and fingerprint
+/// check still apply.
+#[cfg(not(windows))]
+fn lock_vault_for_write(path: &Path) -> Result<fs::File, VaultError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => VaultError::NotFound,
+            _ => VaultError::Io(error.to_string()),
+        })
+}
+
+/// Rotates the retained backup chain and installs `current` as the new `.bak`.
+///
+/// The new backup is fully written and synced to a staging path *before* any
+/// existing generation moves, so a disk-full or permission failure while
+/// writing it can never leave the chain without a usable `.bak` (KV-03). The
+/// final rename is the only step after rotation; if it fails, the previous
+/// `.bak` is moved back into place.
+fn rotate_backups(path: &Path, current: &[u8]) -> Result<(), VaultError> {
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".bak.new");
+    let staged = PathBuf::from(staged);
+    if let Err(error) = write_atomic_bytes(&staged, current) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = commit_backup_rotation(path, &staged) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Moves the staged backup into the chain. Older generations shift first so
+/// `.bak` -> `.bak.1` never clobbers an unrotated `.bak.1`. If installing the
+/// staged file fails, the just-moved `.bak` is restored so recovery still works.
+fn commit_backup_rotation(path: &Path, staged: &Path) -> Result<(), VaultError> {
+    let newest = backup_path(path);
+    let had_newest = newest.exists();
     for generation in (0..BACKUP_GENERATIONS - 1).rev() {
         let newer = backup_path_generation(path, generation);
         let older = backup_path_generation(path, generation + 1);
         if newer.exists() {
             fs::rename(&newer, &older).map_err(|error| VaultError::Io(error.to_string()))?;
         }
+    }
+    if let Err(error) = fs::rename(staged, &newest) {
+        if had_newest {
+            // The previous newest now lives at `.bak.1`; put it back so the
+            // user can still restore even though this save failed.
+            let _ = fs::rename(backup_path_generation(path, 1), &newest);
+        }
+        return Err(VaultError::Io(error.to_string()));
     }
     Ok(())
 }
@@ -583,11 +688,27 @@ pub fn create_vault(
     Ok((graph, salt, key, cost))
 }
 
+/// SHA-256 of raw file bytes. Used to bind a save to the exact file contents
+/// the session opened, which catches an external writer (another process or a
+/// manual restore) that changed the vault after it was unlocked (KV-02).
+pub fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Fingerprint of a vault file on disk.
+pub fn fingerprint_file(path: &Path) -> Result<[u8; 32], VaultError> {
+    let bytes = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
+    Ok(fingerprint_bytes(&bytes))
+}
+
 /// Save under an existing session key. Keeps the previous good vault as
 /// `.bak` (written only after the new vault verifies by re-parsing).
 ///
 /// `cost` must be the cost the session key was derived with, not the current
 /// defaults; see [`KdfCost`].
+#[cfg(test)]
 pub fn save_vault(
     path: &Path,
     graph: &GraphData,
@@ -595,30 +716,74 @@ pub fn save_vault(
     salt: &[u8; SALT_LEN],
     cost: KdfCost,
 ) -> Result<(), VaultError> {
+    save_vault_inner(path, graph, key, salt, cost, None).map(|_| ())
+}
+
+/// Save that refuses to overwrite a file whose contents no longer match the
+/// fingerprint captured when the session opened (KV-02). Returns the new
+/// fingerprint so the caller can bind the next save to the file it just wrote.
+pub fn save_vault_checked(
+    path: &Path,
+    graph: &GraphData,
+    key: &[u8; KEY_LEN],
+    salt: &[u8; SALT_LEN],
+    cost: KdfCost,
+    expected: &[u8; 32],
+) -> Result<[u8; 32], VaultError> {
+    save_vault_inner(path, graph, key, salt, cost, Some(*expected))
+}
+
+fn save_vault_inner(
+    path: &Path,
+    graph: &GraphData,
+    key: &[u8; KEY_LEN],
+    salt: &[u8; SALT_LEN],
+    cost: KdfCost,
+    expected: Option<[u8; 32]>,
+) -> Result<[u8; 32], VaultError> {
     let _guard = vault_write_guard();
     validate_graph(graph)?;
     let sealed = seal_graph(graph, key, salt, cost)?;
     // Actually decrypt and re-parse the new envelope with the session key
     // before replacing the old file; a bad seal must never reach disk.
     let _verified = open_envelope_with_key(&sealed.envelope_json, key)?;
+    // Cross-process critical section. The handle is held through the
+    // fingerprint comparison, backup rotation and replace below, so another
+    // Keevra process cannot slip a different version in between (KV-02).
+    let _file_lock = match lock_vault_for_write(path) {
+        Ok(file) => Some(file),
+        Err(VaultError::NotFound) if expected.is_some() => {
+            // The file vanished after the session opened. Never recreate it
+            // from a stale in-memory snapshot.
+            return Err(VaultError::Io("vault_conflict".to_string()));
+        }
+        Err(VaultError::NotFound) => None,
+        Err(error) => return Err(error),
+    };
     if path.exists() {
+        let current = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
+        if let Some(expected) = expected {
+            if fingerprint_bytes(&current) != expected {
+                return Err(VaultError::Io("vault_conflict".to_string()));
+            }
+        }
         // Preserve the previous vault only after proving it still opens, and
         // rotate older generations so one bad copy cannot erase the last good
         // backup. A current file that no longer verifies leaves the existing
         // backup chain untouched.
-        let current = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
         let verifies = std::str::from_utf8(&current)
             .ok()
             .is_some_and(|text| open_envelope_with_key(text, key).is_ok());
         if verifies {
-            rotate_backups(path)?;
-            // Atomic temp + fsync + rename, exactly like the live file: a
-            // crash mid-copy can never leave a truncated `.bak`.
-            write_atomic_bytes(&backup_path(path), &current)?;
+            rotate_backups(path, &current)?;
+        } else if expected.is_some() {
+            // Same fingerprint as at open time but no longer decryptable:
+            // fail closed instead of overwriting evidence of a corrupt file.
+            return Err(VaultError::Io("vault_conflict".to_string()));
         }
     }
     write_atomic(path, &sealed.envelope_json)?;
-    Ok(())
+    Ok(fingerprint_bytes(sealed.envelope_json.as_bytes()))
 }
 
 /// Structural (non-decrypting) check that a file looks like a Keevra vault
@@ -644,17 +809,46 @@ pub fn looks_like_vault(path: &Path) -> bool {
 /// touched. The current vault is preserved as `<path>.pre-restore`.
 pub fn restore_backup(path: &Path, password: &[u8]) -> Result<(), VaultError> {
     let _guard = vault_write_guard();
-    let backup = backup_path(path);
-    if !backup.exists() {
-        return Err(VaultError::NotFound);
+    // Hold the same writer lock as a save so a restore cannot interleave with
+    // another process copying the file or rotating backups (KV-02/KV-03).
+    let _file_lock = match lock_vault_for_write(path) {
+        Ok(file) => Some(file),
+        Err(VaultError::NotFound) => None,
+        Err(error) => return Err(error),
+    };
+    // Try newest first and accept the first generation that verifies with the
+    // supplied password. If a rotation failed after `.bak` moved aside, the
+    // previous good vault may live at `.bak.1` or `.bak.2`; recovery must still
+    // find it (KV-03).
+    let mut found_any = false;
+    let mut verified: Option<String> = None;
+    for backup in backup_paths(path) {
+        if !backup.exists() {
+            continue;
+        }
+        found_any = true;
+        let Ok(bytes) = read_limited(&backup, MAX_VAULT_BYTES, "vault_too_large") else {
+            continue;
+        };
+        // Byte-preserving parse: `from_utf8_lossy` would silently rewrite a
+        // corrupted backup into something "valid" looking instead of rejecting it.
+        let Ok(contents) = String::from_utf8(bytes) else {
+            continue;
+        };
+        // Wrong password, tampered ciphertext, swapped header and an
+        // unsupported schema all fail here, before the live file changes.
+        if open_graph(&contents, password).is_ok() {
+            verified = Some(contents);
+            break;
+        }
     }
-    let bytes = read_limited(&backup, MAX_VAULT_BYTES, "vault_too_large")?;
-    // Byte-preserving parse: `from_utf8_lossy` would silently rewrite a
-    // corrupted backup into something "valid" looking instead of rejecting it.
-    let contents = String::from_utf8(bytes).map_err(|_| VaultError::WrongPasswordOrCorrupt)?;
-    // Wrong password, tampered ciphertext, swapped header and an unsupported
-    // schema all fail here, before the live file changes.
-    open_graph(&contents, password)?;
+    let Some(contents) = verified else {
+        return Err(if found_any {
+            VaultError::WrongPasswordOrCorrupt
+        } else {
+            VaultError::NotFound
+        });
+    };
     if path.exists() {
         let current = read_limited(path, MAX_VAULT_BYTES, "vault_too_large")?;
         write_atomic_bytes(&pre_restore_path(path), &current)?;
@@ -667,6 +861,138 @@ pub fn restore_backup(path: &Path, password: &[u8]) -> Result<(), VaultError> {
 /// save-time orphan sweep so the rollback remains usable.
 pub fn pre_restore_path_for(path: &Path) -> PathBuf {
     pre_restore_path(path)
+}
+
+/// Rejects export/download targets that would overwrite Keevra-owned state
+/// (KV-01).
+///
+/// `protected_files` are files the caller knows about (the open vault and every
+/// registered vault, plus the registry and settings files). Backup
+/// generations, restore copies and attachment directories are derived from
+/// each vault here, so a caller cannot forget one. `protected_dirs` are whole
+/// app-owned directories; no export may land inside them.
+///
+/// The target is also refused when *any* path component is named like a Keevra
+/// artifact, so writing inside an attachment or backup directory fails even
+/// when the leaf name is harmless. Equality is checked against canonical
+/// identities (and, for a target that does not exist yet, its canonical parent
+/// + file name) to defeat `..`, case and symlink aliases on Windows.
+pub fn ensure_export_destination(
+    dest: &Path,
+    protected_files: &[PathBuf],
+    protected_dirs: &[PathBuf],
+) -> Result<(), VaultError> {
+    // Any component named like a Keevra artifact is refused, not just the final
+    // file name: a blob or backup directory can be reached by writing *inside*
+    // a path whose leaf looks harmless.
+    let reserved_component = dest.components().any(|component| match component {
+        std::path::Component::Normal(name) => match name.to_str() {
+            Some(text) => is_reserved_artifact_name(text),
+            // A non-Unicode name cannot be checked; fail closed.
+            None => true,
+        },
+        _ => false,
+    });
+    if reserved_component
+        || protected_files
+            .iter()
+            .any(|protected| paths_match(dest, protected))
+    {
+        return Err(VaultError::Io("protected_destination".to_string()));
+    }
+
+    let mut dirs: Vec<PathBuf> = protected_dirs.to_vec();
+    for vault in protected_files {
+        let mut staging = vault.as_os_str().to_owned();
+        staging.push(".bak.new");
+        if paths_match(dest, &pre_restore_path(vault))
+            || paths_match(dest, &PathBuf::from(staging))
+            || backup_paths(vault)
+                .iter()
+                .any(|backup| paths_match(dest, backup))
+        {
+            return Err(VaultError::Io("protected_destination".to_string()));
+        }
+        let blobs = crate::attachments::attachments_dir(vault);
+        if paths_match(dest, &blobs) {
+            return Err(VaultError::Io("protected_destination".to_string()));
+        }
+        dirs.push(blobs);
+    }
+    if dirs.iter().any(|dir| path_within(dest, dir)) {
+        return Err(VaultError::Io("protected_destination".to_string()));
+    }
+    Ok(())
+}
+
+/// Names that are always Keevra-owned regardless of which directory they are
+/// in: any vault envelope (`.vault`), its sidecars (`.vault.bak*`,
+/// `.vault.pre-restore`, `.vault.attachments`) and the registry/settings files
+/// (including the `.corrupt-*` preserved copies).
+fn is_reserved_artifact_name(name: &str) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower == "vaults.json"
+        || lower.starts_with("vaults.json.")
+        || lower == "settings.json"
+        || lower.starts_with("settings.json.")
+    {
+        return true;
+    }
+    lower.ends_with(".vault") || lower.contains(".vault.")
+}
+
+/// Every path spelling that can identify `path`: as given, canonicalized, and
+/// canonical-parent + file name (which also works when the file is missing).
+fn comparison_forms(path: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(path) {
+        forms.push(canonical);
+    }
+    if let (Some(name), Some(parent)) = (
+        path.file_name(),
+        path.parent().filter(|parent| !parent.as_os_str().is_empty()),
+    ) {
+        if let Ok(parent) = fs::canonicalize(parent) {
+            forms.push(parent.join(name));
+        }
+    }
+    forms
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    let right_forms = comparison_forms(right);
+    comparison_forms(left)
+        .iter()
+        .any(|left| right_forms.iter().any(|right| same_path(left, right)))
+}
+
+fn path_within(candidate: &Path, root: &Path) -> bool {
+    let candidate = path_text(candidate);
+    let root = path_text(root);
+    let root = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+    candidate == root
+        || candidate.starts_with(&format!("{root}{}", std::path::MAIN_SEPARATOR))
+}
+
+fn path_text(path: &Path) -> String {
+    let text = path
+        .to_string_lossy()
+        .replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR);
+    #[cfg(windows)]
+    {
+        text.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        text
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    path_text(left) == path_text(right)
 }
 
 /// Attachment IDs referenced by an encrypted vault file on disk, decrypted
@@ -1246,5 +1572,190 @@ mod tests {
             "ciphertext_b64": B64.encode([1u8; 32]),
         });
         assert!(validate_envelope_value(&oversized).is_err());
+    }
+
+    /// KV-01: exports may not land on a vault, its backups/restore/attachment
+    /// artifacts, the registry/settings files, or anywhere in an app-owned dir.
+    #[test]
+    fn export_destination_guard_rejects_keevra_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "keevra-test-{}-export-guard",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let vault = dir.join("personal.vault");
+        fs::write(&vault, b"ciphertext").expect("vault");
+        let protected = vec![vault.clone()];
+        let app_dir = dir.join("keevra");
+        let dirs = vec![app_dir.clone()];
+        let blobs = crate::attachments::attachments_dir(&vault);
+        let mut backup_staging = vault.as_os_str().to_owned();
+        backup_staging.push(".bak.new");
+        let backup_staging = PathBuf::from(backup_staging);
+
+        for target in [
+            vault.clone(),
+            backup_path(&vault),
+            backup_path_generation(&vault, 1),
+            backup_path_generation(&vault, 2),
+            backup_staging,
+            pre_restore_path(&vault),
+            blobs.clone(),
+            blobs.join("x.bin"),
+            dir.join("x.vault.attachments").join("y.bin"),
+            dir.join("nested").join("x.vault.bak").join("y.bin"),
+            dir.join("vaults.json"),
+            dir.join("settings.json"),
+            dir.join("other.vault"),
+        ] {
+            assert!(
+                ensure_export_destination(&target, &protected, &dirs).is_err(),
+                "protected target accepted: {}",
+                target.display()
+            );
+        }
+
+        // A plain export file beside the vault stays allowed.
+        let dest = dir.join("export.vtpkg.json");
+        ensure_export_destination(&dest, &protected, &dirs).expect("safe export");
+        // Anything inside the app-owned directory is refused even when its
+        // name looks harmless.
+        let hidden = app_dir.join("notes.txt");
+        assert!(ensure_export_destination(&hidden, &protected, &dirs).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// KV-02: the writer lock is an OS handle lock, not just a process mutex.
+    /// A second writer is refused while the first handle is open, and the
+    /// atomic replace still succeeds under the lock.
+    #[cfg(windows)]
+    #[test]
+    fn writer_lock_excludes_a_second_writer_and_allows_replace() {
+        let path = unique_path("writer-lock");
+        let _ = fs::remove_file(&path);
+        create_vault(&path, b"pw").expect("create");
+        let first = lock_vault_for_write_within(&path, Duration::ZERO).expect("first lock");
+        assert!(matches!(
+            lock_vault_for_write_within(&path, Duration::ZERO),
+            Err(VaultError::Io(ref message)) if message == "vault_conflict"
+        ));
+        write_atomic(&path, "replacement").expect("replace while locked");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "replacement");
+        drop(first);
+        lock_vault_for_write_within(&path, Duration::ZERO).expect("released");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// KV-02: a save whose fingerprint no longer matches the file (another
+    /// process, a manual restore, or a different password) is refused and the
+    /// newest file is left untouched.
+    #[test]
+    fn external_change_is_refused_instead_of_overwritten() {
+        let path = unique_path("conflict");
+        for generation in 0..BACKUP_GENERATIONS {
+            let _ = fs::remove_file(backup_path_generation(&path, generation));
+        }
+        let password = b"correct horse battery";
+        let (_, salt, key, cost) = create_vault(&path, password).expect("create");
+        let first = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "a", "name": "A", "service": "", "tags": [], "fields": []}],
+        }));
+        let opened_fingerprint = fingerprint_file(&path).expect("fingerprint");
+        let new_fingerprint =
+            save_vault_checked(&path, &first, &key, &salt, cost, &opened_fingerprint)
+                .expect("first checked save");
+        assert_eq!(new_fingerprint, fingerprint_file(&path).expect("new fingerprint"));
+
+        // Same-key external writer (a second Keevra process).
+        let external = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "b", "name": "B", "service": "", "tags": [], "fields": []}],
+        }));
+        save_vault(&path, &external, &key, &salt, cost).expect("external save");
+        let newest = fs::read(&path).expect("newest");
+        let error = save_vault_checked(&path, &first, &key, &salt, cost, &new_fingerprint)
+            .expect_err("stale save must be refused");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "vault_conflict"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(fs::read(&path).expect("untouched"), newest);
+
+        // A different-password rewrite is also a conflict, never a silent
+        // overwrite that would hide the other file.
+        let other = unique_path("conflict-other");
+        let _ = fs::remove_file(&other);
+        create_vault(&other, b"another password entirely").expect("other vault");
+        fs::copy(&other, &path).expect("foreign rewrite");
+        let foreign = fs::read(&path).expect("foreign");
+        let error = save_vault_checked(&path, &first, &key, &salt, cost, &new_fingerprint)
+            .expect_err("foreign save must be refused");
+        assert!(
+            matches!(error, VaultError::Io(ref message) if message == "vault_conflict"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(fs::read(&path).expect("untouched"), foreign);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&other);
+        for generation in 0..BACKUP_GENERATIONS {
+            let _ = fs::remove_file(backup_path_generation(&path, generation));
+            let _ = fs::remove_file(backup_path_generation(&other, generation));
+        }
+        let _ = fs::remove_file(pre_restore_path(&path));
+    }
+
+    /// KV-03: if installing the newly staged backup fails after `.bak` moved
+    /// aside, the previous `.bak` is put back and restore still works.
+    #[test]
+    fn failed_backup_install_keeps_previous_bak_restorable() {
+        let path = unique_path("rotation-failure");
+        for generation in 0..BACKUP_GENERATIONS {
+            let _ = fs::remove_file(backup_path_generation(&path, generation));
+        }
+        let _ = fs::remove_file(pre_restore_path(&path));
+        let password = b"correct horse battery";
+        let (_, salt, key, cost) = create_vault(&path, password).expect("create");
+        let first = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "a", "name": "A", "service": "", "tags": [], "fields": []}],
+        }));
+        save_vault(&path, &first, &key, &salt, cost).expect("save first");
+        let second = doc(serde_json::json!({
+            "schemaVersion": 3,
+            "accounts": [{"id": "b", "name": "B", "service": "", "tags": [], "fields": []}],
+        }));
+        save_vault(&path, &second, &key, &salt, cost).expect("save second");
+        let bak_before = fs::read(backup_path(&path)).expect("backup");
+
+        // Simulate the final install rename failing (disk full / permission):
+        // rotation has already moved `.bak` to `.bak.1` when this returns.
+        let missing_staged = path.with_extension("missing-staged");
+        commit_backup_rotation(&path, &missing_staged).expect_err("install must fail");
+
+        assert_eq!(
+            fs::read(backup_path(&path)).expect("recovered backup"),
+            bak_before,
+            "previous .bak must be restored after a failed install"
+        );
+        restore_backup(&path, password).expect("restore from recovered .bak");
+        let (restored, _, _, _) =
+            open_graph(&read_vault_file(&path).expect("read"), password).expect("restored opens");
+        assert_eq!(
+            restored
+                .get("accounts")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("id")),
+            Some(&serde_json::json!("a"))
+        );
+
+        let _ = fs::remove_file(&path);
+        for generation in 0..BACKUP_GENERATIONS {
+            let _ = fs::remove_file(backup_path_generation(&path, generation));
+        }
+        let _ = fs::remove_file(pre_restore_path(&path));
     }
 }

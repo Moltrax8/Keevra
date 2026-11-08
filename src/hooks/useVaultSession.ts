@@ -64,6 +64,8 @@ export interface VaultSessionApi {
   backend: BackendState;
   vaultPath: string;
   setVaultPath: (path: string) => void;
+  /** Backend session generation the loaded document belongs to. */
+  vaultGeneration: number | null;
   vaultName: string;
   vaults: VaultEntry[];
   defaultVaultPath: string | null;
@@ -87,6 +89,11 @@ export interface VaultSessionApi {
   handleImportPackage: () => Promise<void>;
   /** Returns false when unsaved changes could not be written. */
   handleVaultLock: () => Promise<boolean>;
+  /**
+   * Drops the in-memory document without saving so the user can reopen the
+   * version another process wrote (KV-02). Unsaved edits are discarded.
+   */
+  handleVaultReloadExternal: () => Promise<boolean>;
   /** Flush and lock before closing the window; false keeps the window open. */
   handleVaultClose: () => Promise<boolean>;
 }
@@ -101,6 +108,9 @@ export function useVaultSession({
 }: VaultSessionOptions): VaultSessionApi {
   const [backend, setBackend] = useState<BackendState>("checking");
   const [vaultPath, setVaultPath] = useState("");
+  // Bound to the document currently in memory. Null while a switch is in
+  // progress, so a delayed save cannot claim the new session (KV-04).
+  const [vaultGeneration, setVaultGeneration] = useState<number | null>(null);
   const [vaultName, setVaultName] = useState("");
   const [vaults, setVaults] = useState<VaultEntry[]>([]);
   const [defaultVaultPath, setDefaultVaultPath] = useState<string | null>(null);
@@ -149,6 +159,7 @@ export function useVaultSession({
           setVaultName(entries[0]?.name ?? "");
         }
         if (!status.unlocked) {
+          setVaultGeneration(null);
           setBackend("locked");
           return;
         }
@@ -158,10 +169,12 @@ export function useVaultSession({
         try {
           applyVaultDocument(await vaultGetDocument());
           if (cancelled) return;
+          setVaultGeneration(status.generation);
           setBackend("unlocked");
         } catch {
           await vaultLock().catch(() => {});
           if (cancelled) return;
+          setVaultGeneration(null);
           setLockError("The open vault could not be reloaded. Enter your password to continue.");
           setBackend("locked");
         }
@@ -219,12 +232,13 @@ export function useVaultSession({
     setLockNotice(null);
     let sessionOpened = false;
     try {
-      const graph = await vaultOpen(path, password);
+      const opened = await vaultOpen(path, password);
       sessionOpened = true;
       // A document this build cannot parse must not leave an unlocked Rust
       // session behind while the UI shows the lock screen.
-      applyVaultDocument(graph);
+      applyVaultDocument(opened.graph);
       setVaultPath(path);
+      setVaultGeneration(opened.generation);
       const entries = await refreshVaults();
       setVaultName(entries.find((item) => item.path === path)?.name ?? "");
       setBackend("unlocked");
@@ -258,6 +272,7 @@ export function useVaultSession({
       const created = await vaultCreate(name, password, hint === "" ? undefined : hint);
       applyVaultDocument(created.graph);
       setVaultPath(created.path);
+      setVaultGeneration(created.generation);
       setVaultName(name);
       await refreshVaults();
       setBackend("unlocked");
@@ -338,6 +353,7 @@ export function useVaultSession({
       const created = await vaultCreate(name, password, hint === "" ? undefined : hint);
       applyVaultDocument(created.graph);
       setVaultPath(created.path);
+      setVaultGeneration(created.generation);
       setVaultName(name);
       await refreshVaults();
       setShowSettings(false);
@@ -428,8 +444,13 @@ export function useVaultSession({
       setPackageMessage(
         `Exported encrypted package with ${count} attachment(s). Attachment integrity was verified; no plaintext left the app.`,
       );
-    } catch {
-      setPackageMessage("Package export failed.");
+    } catch (error) {
+      const message = typeof error === "string" ? error : "";
+      setPackageMessage(
+        message.includes("protected_destination")
+          ? "That location belongs to Keevra. Choose a different file name or folder."
+          : "Package export failed.",
+      );
     }
   }
 
@@ -482,6 +503,30 @@ export function useVaultSession({
     }
     setLockError(null);
     onLocked();
+    setVaultGeneration(null);
+    setBackend("locked");
+    return true;
+  }
+
+  /**
+   * Resolution for `vault_conflict`: the file on disk was changed by another
+   * process, so writing this document would overwrite that change. Lock without
+   * saving and let the user unlock again from the newest file. Returns false
+   * only when the backend session could not be dropped.
+   */
+  async function handleVaultReloadExternal(): Promise<boolean> {
+    try {
+      await vaultLock();
+    } catch {
+      setLockError("Could not drop the changed vault session. Restart the app.");
+      return false;
+    }
+    setLockError(null);
+    setLockNotice(
+      "The vault was changed on disk. Unlock again to load the newest version; unsaved edits from this window were discarded.",
+    );
+    onLocked();
+    setVaultGeneration(null);
     setBackend("locked");
     return true;
   }
@@ -505,6 +550,7 @@ export function useVaultSession({
     }
     setLockError(null);
     onLocked();
+    setVaultGeneration(null);
     setBackend("locked");
     return true;
   }
@@ -513,6 +559,7 @@ export function useVaultSession({
     backend,
     vaultPath,
     setVaultPath,
+    vaultGeneration,
     vaultName,
     vaults,
     defaultVaultPath,
@@ -535,6 +582,7 @@ export function useVaultSession({
     handleExportPackage,
     handleImportPackage,
     handleVaultLock,
+    handleVaultReloadExternal,
     handleVaultClose,
   };
 }

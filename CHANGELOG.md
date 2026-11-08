@@ -4,6 +4,76 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.3] - 2026-11-08
+
+**Security-hardening release: protected exports, conflict-aware saves and durable backups.**
+
+This release closes every finding from the independent 2026-11-07 review
+(KV-01…KV-06) and the remaining N-02 crash window. Existing vaults, backups
+and packages stay compatible; there are no on-disk format changes.
+
+### Added
+
+- **Structured release notes in the update dialog.** Release bodies are parsed
+  into a title, highlighted badges, version/date, section cards, emoji and
+  bullet lists instead of being shown as raw text. The dialog keeps the signed
+  manifest checks and the manual-install flow; `docs/RELEASE_NOTES_TEMPLATE.md`
+  documents the markdown shape the renderer understands.
+
+### Security
+
+- **Export and download targets are checked in Rust (KV-01).** Attachment
+  export, package export and the verified update download now refuse the open
+  vault, every registered vault, their `.bak*`/`.pre-restore` copies, blob
+  directories, `vaults.json`, `settings.json` and the app data directory. The
+  check uses canonical path identities (including a missing target's resolved
+  parent), so `..`, case and link aliases cannot bypass it, and any path
+  component named like a Keevra artifact (`.vault`, `.vault.bak*`,
+  `.vault.pre-restore`, `.vault.attachments`, `vaults.json`) is refused even
+  when the final file name looks harmless. Update installers are additionally
+  restricted to `.exe` targets outside the app data directory.
+- **Saves are bound to the file they opened (KV-02).** Each session records a
+  SHA-256 fingerprint of the vault and compares it under the write lock right
+  before replacing the file. On Windows an OS-level writer lock (share mode
+  denying other writers, allowing readers and the atomic replace) is held
+  across the compare/rotate/replace sequence, so a second Keevra process cannot
+  slip a save in between. A save after an external change (another process, a
+  manual restore or a different password) fails with `vault_conflict`, leaves
+  the newest file and its backups untouched, and the top bar offers
+  “Discard & reload” instead of a retry that could never succeed. Restore takes
+  the same writer lock.
+- **Saves are bound to the session that prepared the document (KV-04).**
+  `vault_save` now takes `expected_path` + `expected_generation` and validates
+  them while holding the session lock through the write; a queued snapshot from
+  another vault is refused with `vault_changed` instead of being encrypted
+  into the current vault. The renderer keeps the generation with the document
+  and clears it on lock, so a stale auto-save cannot claim a new session.
+
+### Fixed
+
+- **Backup rotation no longer loses the recoverable `.bak` (KV-03).** The new
+  backup is staged and synced before any generation moves; if installing it
+  fails, the previous `.bak` is moved back. Restore now verifies `.bak`,
+  `.bak.1` and `.bak.2` in order and picks the newest generation that opens
+  with the supplied password.
+- **Malformed records are quarantined instead of dropped (KV-05).** Records
+  that cannot be parsed (accounts, presets, fields, preset fields and
+  attachments) are kept verbatim and encrypted under
+  `extraKeys.unmigratedRecords`, appended across repeated loads. The warning
+  now says the raw values were preserved.
+- **A failed registry write rolls back a new vault (KV-06).** If
+  `vaults.json` cannot be written after creating or importing a vault, the new
+  vault, backups and attachment directory are removed instead of leaving
+  unreachable ciphertext on disk.
+- **An interrupted import no longer orphans an attachment directory (N-02).**
+  The staged attachment directory carries an import marker until the vault
+  rename commits the import. If the app dies after the directory reaches its
+  final path but before the vault file exists, startup cleanup now recognises
+  the marker and removes that directory after the same one-hour age gate.
+  Directories without the marker (user data) and a completed import's
+  directory are left untouched; a late crash after the vault rename only
+  drops the stale marker.
+
 ## [0.2.2] - 2026-11-07
 
 Follow-up to the independent review of `440dfd7`, closing K-01, K-03, N-01,

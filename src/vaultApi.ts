@@ -27,6 +27,12 @@ export interface VaultEntry {
 export interface CreatedVault {
   graph: VaultGraph;
   path: string;
+  generation: number;
+}
+
+export interface OpenedVault {
+  graph: VaultGraph;
+  generation: number;
 }
 
 export interface AppSettings {
@@ -76,8 +82,8 @@ export interface VaultDeleteResult {
   listingRemoved: boolean;
 }
 
-export async function vaultOpen(path: string, password: string): Promise<VaultGraph> {
-  return invoke<VaultGraph>("vault_open", { path, password });
+export async function vaultOpen(path: string, password: string): Promise<OpenedVault> {
+  return invoke<OpenedVault>("vault_open", { path, password });
 }
 
 /** Document of the session that is already unlocked in Rust (reload recovery). */
@@ -85,8 +91,18 @@ export async function vaultGetDocument(): Promise<VaultGraph> {
   return invoke<VaultGraph>("vault_get_document");
 }
 
-export async function vaultSave(graph: VaultGraph, retainAttachmentIds: string[] = []): Promise<void> {
-  return invoke<void>("vault_save", { graph, retainAttachmentIds });
+export async function vaultSave(
+  graph: VaultGraph,
+  retainAttachmentIds: string[],
+  expectedPath: string,
+  expectedGeneration: number,
+): Promise<void> {
+  return invoke<void>("vault_save", {
+    graph,
+    retainAttachmentIds,
+    expectedPath,
+    expectedGeneration,
+  });
 }
 
 export async function vaultLock(): Promise<void> {
