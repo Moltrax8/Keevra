@@ -8,3 +8,9 @@ edition = "2021"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+
+# Maintainer-only tool: symbol tables are never needed here, so keep its
+# target directory small instead of letting debuginfo accumulate.
+[profile.dev]
+debug = 0
+incremental = false
