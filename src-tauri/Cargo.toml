@@ -36,3 +36,11 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Test and `tauri dev` builds only need to run, not to be debugged: dropping
+# debuginfo and incremental state keeps `target/debug` small instead of
+# letting it grow to many gigabytes. Debug assertions and overflow checks stay
+# on, so tests behave exactly as before.
+[profile.dev]
+debug = 0
+incremental = false
