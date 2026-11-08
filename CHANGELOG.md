@@ -4,6 +4,27 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [Unreleased]
+
+**Update downloads no longer depend on GitHub's release-download redirect.**
+
+GitHub can answer `github.com/.../releases/download/...` with 5xx while the
+same asset is still served by its API. During the 2026-11-08 outage that path
+returned 504 for every release asset, so a correct build could still fail with
+“Could not fetch the signed manifest”. Downloads now fall back to
+`api.github.com/repos/<owner>/<repo>/releases/assets/<id>` when the redirect
+fails.
+
+### Fixed
+
+- **Manifest and installer downloads survive a broken release-download
+  redirect.** `fetch_signed_manifest` and `download_verified` retry the same
+  asset through the GitHub asset API (`Accept: application/octet-stream`).
+  Nothing about the trust model changes: the manifest signature and the
+  installer SHA256 are still checked, and the asset is matched by file name
+  against the release that was requested. Release metadata is capped at 2 MiB,
+  and `api.github.com` was already on the allow-list.
+
 ## [0.2.4] - 2026-11-08
 
 **In-app update download works again: the signed manifest is fetched by the trusted backend.**

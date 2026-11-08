@@ -143,6 +143,9 @@ fn update_http_client() -> Result<reqwest::Client, VaultError> {
         attempt.follow()
     });
     reqwest::Client::builder()
+        // GitHub's API rejects requests without a User-Agent, and the same
+        // client serves the asset-API fallback.
+        .user_agent(concat!("Keevra/", env!("CARGO_PKG_VERSION")))
         .redirect(policy)
         .build()
         .map_err(|e| VaultError::Io(format!("update_client_failed:{e}")))
@@ -170,15 +173,82 @@ fn manifest_fetch_targets(
     Ok((validate_update_url(manifest_url)?, validate_update_url(sig_url)?))
 }
 
-/// Fetches a small text document over the update channel with a hard byte cap.
-async fn fetch_limited_text(
+/// GitHub only serves raw asset bytes when this header is present; without it
+/// an asset URL answers with its JSON metadata instead.
+const BINARY_ACCEPT: &str = "application/octet-stream";
+/// Header for GitHub's JSON API.
+const JSON_ACCEPT: &str = "application/vnd.github+json";
+/// Release metadata stays small even for releases with many assets.
+const MAX_API_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The slice of `GET /repos/{owner}/{repo}/releases/tags/{tag}` the fallback
+/// needs: asset names mapped to their download endpoints.
+#[derive(Debug, Deserialize)]
+struct ApiRelease {
+    assets: Vec<ApiAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiAsset {
+    name: String,
+    url: String,
+}
+
+/// Splits `https://github.com/{owner}/{repo}/releases/download/{tag}/{name}`.
+///
+/// The asset-API fallback applies only to that exact shape, so redirects, CDN
+/// URLs and plain repository links never trigger an extra API request.
+fn release_download_parts(url: &reqwest::Url) -> Option<(String, String, String, String)> {
+    if url.scheme() != "https" || url.host_str()? != "github.com" {
+        return None;
+    }
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    // ["{owner}", "{repo}", "releases", "download", "{tag}", "{name}"]
+    if segments.len() != 6 || segments[2] != "releases" || segments[3] != "download" {
+        return None;
+    }
+    let (owner, repo, tag, name) = (segments[0], segments[1], segments[4], segments[5]);
+    if [owner, repo, tag, name].iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    Some((
+        owner.to_string(),
+        repo.to_string(),
+        tag.to_string(),
+        name.to_string(),
+    ))
+}
+
+/// `https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}`.
+fn release_api_url(parts: &(String, String, String, String)) -> Result<reqwest::Url, VaultError> {
+    let mut url = reqwest::Url::parse("https://api.github.com")
+        .map_err(|_| VaultError::Io("invalid_update_url".to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| VaultError::Io("invalid_update_url".to_string()))?
+        .extend(["repos", &parts.0, &parts.1, "releases", "tags", &parts.2]);
+    Ok(url)
+}
+
+/// A failure a different endpoint might not repeat: transport error, TLS
+/// problem, closed connection or an HTTP error status. Policy errors (size cap,
+/// rejected URL) are never retried elsewhere.
+fn is_download_failure(error: &VaultError) -> bool {
+    matches!(error, VaultError::Io(message) if message.starts_with("update_download_failed"))
+}
+
+/// GET `url` with an optional `Accept` header and a hard byte cap.
+async fn get_capped_bytes(
+    client: &reqwest::Client,
     url: reqwest::Url,
+    accept: Option<&str>,
     cap: u64,
     too_large: &str,
-) -> Result<String, VaultError> {
-    let client = update_http_client()?;
-    let mut response = client
-        .get(url)
+) -> Result<Vec<u8>, VaultError> {
+    let mut request = client.get(url);
+    if let Some(accept) = accept {
+        request = request.header(reqwest::header::ACCEPT, accept);
+    }
+    let mut response = request
         .send()
         .await
         .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
@@ -188,6 +258,8 @@ async fn fetch_limited_text(
     if response.content_length().is_some_and(|length| length > cap) {
         return Err(VaultError::Io(too_large.to_string()));
     }
+    // Stream with a running byte counter: a hostile/chunked response can never
+    // force the whole body into memory before the cap is applied (K-10).
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -199,6 +271,67 @@ async fn fetch_limited_text(
         }
         bytes.extend_from_slice(&chunk);
     }
+    Ok(bytes)
+}
+
+/// Maps a release asset URL to its `api.github.com` endpoint by file name.
+/// `None` means "not a plain release download, or no asset of that name".
+async fn api_asset_url(
+    client: &reqwest::Client,
+    original: &reqwest::Url,
+) -> Result<Option<reqwest::Url>, VaultError> {
+    let Some(parts) = release_download_parts(original) else {
+        return Ok(None);
+    };
+    let metadata = get_capped_bytes(
+        client,
+        release_api_url(&parts)?,
+        Some(JSON_ACCEPT),
+        MAX_API_METADATA_BYTES,
+        "update_metadata_too_large",
+    )
+    .await?;
+    let release: ApiRelease = serde_json::from_slice(&metadata)
+        .map_err(|_| VaultError::Io("update_metadata_invalid".to_string()))?;
+    let asset = release.assets.iter().find(|asset| asset.name == parts.3);
+    match asset {
+        Some(asset) => Ok(Some(validate_update_url(&asset.url)?)),
+        None => Ok(None),
+    }
+}
+
+/// Downloads over the update channel, falling back to the GitHub asset API.
+///
+/// `github.com/{owner}/{repo}/releases/download/...` can answer 5xx or drop the
+/// connection while `api.github.com` still serves the identical bytes. The
+/// fallback only changes where those bytes come from: the caller's signature
+/// and SHA256 checks still decide whether they are accepted.
+async fn fetch_update_bytes(
+    url: reqwest::Url,
+    cap: u64,
+    too_large: &str,
+) -> Result<Vec<u8>, VaultError> {
+    let client = update_http_client()?;
+    match get_capped_bytes(&client, url.clone(), None, cap, too_large).await {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if is_download_failure(&error) => match api_asset_url(&client, &url).await {
+            Ok(Some(api_url)) => {
+                get_capped_bytes(&client, api_url, Some(BINARY_ACCEPT), cap, too_large).await
+            }
+            Ok(None) => Err(error),
+            Err(fallback_error) => Err(fallback_error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+/// Fetches a small text document over the update channel with a hard byte cap.
+async fn fetch_limited_text(
+    url: reqwest::Url,
+    cap: u64,
+    too_large: &str,
+) -> Result<String, VaultError> {
+    let bytes = fetch_update_bytes(url, cap, too_large).await?;
     String::from_utf8(bytes).map_err(|_| VaultError::Io("update_manifest_not_utf8".to_string()))
 }
 
@@ -232,34 +365,7 @@ pub async fn download_verified(
         return Err(VaultError::Io("invalid_update_sha".to_string()));
     }
     let parsed = validate_update_url(url)?;
-    let client = update_http_client()?;
-    let mut response = client
-        .get(parsed)
-        .send()
-        .await
-        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
-    if !response.status().is_success() {
-        return Err(VaultError::Io("update_download_failed".to_string()));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_UPDATE_BYTES)
-    {
-        return Err(VaultError::Io("update_too_large".to_string()));
-    }
-    // Stream with a running byte counter: a hostile/chunked response can never
-    // force the whole body into memory before the cap is applied (K-10).
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?
-    {
-        if bytes.len() as u64 + chunk.len() as u64 > MAX_UPDATE_BYTES {
-            return Err(VaultError::Io("update_too_large".to_string()));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = fetch_update_bytes(parsed, MAX_UPDATE_BYTES, "update_too_large").await?;
     let digest = Sha256::digest(&bytes);
     let actual = format!("{digest:x}");
     if actual != expected {
@@ -357,12 +463,117 @@ mod tests {
     }
 
     #[test]
-    fn version_gate_refuses_downgrades() {
-        assert!(is_newer_version("v1.0.0", "v1.0.1"));
+    fn release_download_urls_map_to_api_endpoints() {
+        let url = reqwest::Url::parse(
+            "https://github.com/Moltrax8/Keevra/releases/download/v0.2.4/updates.json",
+        )
+        .expect("valid url");
+        let parts = release_download_parts(&url).expect("plain release download url");
+        assert_eq!(parts.0, "Moltrax8");
+        assert_eq!(parts.1, "Keevra");
+        assert_eq!(parts.2, "v0.2.4");
+        assert_eq!(parts.3, "updates.json");
+
+        let api = release_api_url(&parts).expect("api url");
+        assert_eq!(
+            api.as_str(),
+            "https://api.github.com/repos/Moltrax8/Keevra/releases/tags/v0.2.4"
+        );
+        // The asset endpoints the fallback then downloads from are themselves
+        // on the update allow-list, so redirect checks still apply to them.
+        assert!(validate_update_url(
+            "https://api.github.com/repos/Moltrax8/Keevra/releases/assets/723568256"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn api_fallback_only_applies_to_plain_release_downloads() {
+        for url in [
+            "https://github.com/Moltrax8/Keevra/releases/tag/v0.2.4",
+            "https://github.com/Moltrax8/Keevra/releases/download/v0.2.4",
+            "https://github.com/Moltrax8/Keevra/releases/download/v0.2.4/",
+            "https://api.github.com/repos/Moltrax8/Keevra/releases/assets/1",
+            "https://objects.githubusercontent.com/Moltrax8/Keevra/releases/download/v0.2.4/x",
+            "http://github.com/Moltrax8/Keevra/releases/download/v0.2.4/x",
+        ] {
+            let parsed = reqwest::Url::parse(url).expect("valid url");
+            assert!(
+                release_download_parts(&parsed).is_none(),
+                "{url} must not trigger the asset-API fallback"
+            );
+        }
+        // Names with characters that need escaping are kept as they appear on
+        // the release, which is what the asset list compares against.
+        let encoded = reqwest::Url::parse(
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/Keevra_1_x64-setup.exe",
+        )
+        .expect("valid url");
+        assert_eq!(
+            release_download_parts(&encoded).expect("plain release download url").3,
+            "Keevra_1_x64-setup.exe"
+        );
+    }
+
+    #[test]
+    fn version_gate_refuses_downgrades() {        assert!(is_newer_version("v1.0.0", "v1.0.1"));
         assert!(!is_newer_version("v1.0.1", "v1.0.0"));
         assert!(!is_newer_version("v1.0.1", "v1.0.1"));
         assert!(!is_newer_version("0.2.0", "0.2.0"));
         assert!(is_newer_version("0.2.0", "0.3.0"));
+    }
+
+    #[test]
+    #[ignore = "hits the live GitHub API"]
+    fn live_manifest_fetch_and_installer_download() {
+        // Opt-in smoke test for the real network path:
+        //   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored
+        // It proves the asset-API fallback works while github.com's release
+        // download redirect is misbehaving, then downloads the installer it
+        // names and checks the signed SHA256.
+        let tag = "v0.2.4";
+        let manifest_url =
+            format!("https://github.com/Moltrax8/Keevra/releases/download/{tag}/updates.json");
+        let sig_url = format!("{manifest_url}.minisig");
+        let (manifest, sig) =
+            tauri::async_runtime::block_on(fetch_signed_manifest(&manifest_url, &sig_url))
+                .expect("live manifest fetch");
+        let parsed = parse_verified_manifest(&manifest, &sig).expect("live manifest verifies");
+        assert!(!parsed.version.is_empty());
+
+        // Exercise the fallback itself, whatever github.com is doing today:
+        // resolve the same asset through api.github.com and fetch its bytes.
+        let client = update_http_client().expect("update client");
+        let original = reqwest::Url::parse(&manifest_url).expect("manifest url");
+        let api_url = tauri::async_runtime::block_on(api_asset_url(&client, &original))
+            .expect("asset lookup")
+            .expect("manifest asset exists");
+        let via_api = tauri::async_runtime::block_on(get_capped_bytes(
+            &client,
+            api_url,
+            Some(BINARY_ACCEPT),
+            MAX_MANIFEST_BYTES,
+            "update_manifest_too_large",
+        ))
+        .expect("asset API download");
+        assert_eq!(via_api, manifest.as_bytes());
+
+        let installer_url = format!(
+            "https://github.com/Moltrax8/Keevra/releases/download/{tag}/{}",
+            parsed.assets[0].name
+        );
+        let dest = std::env::temp_dir().join("keevra-live-update-smoke.exe");
+        let (bytes, version) = tauri::async_runtime::block_on(download_manifest_asset(
+            &installer_url,
+            &manifest,
+            &sig,
+            "0.2.0",
+            &dest,
+        ))
+        .expect("live installer download");
+        let _ = std::fs::remove_file(&dest);
+        assert_eq!(version, parsed.version);
+        assert!(bytes > 1_000_000, "installer bytes: {bytes}");
     }
 
     #[test]

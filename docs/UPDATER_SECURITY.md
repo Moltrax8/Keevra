@@ -17,6 +17,13 @@ This document is the authority for the update channel alongside
   checks every redirect hop. The production CSP therefore allows only
   `api.github.com` for the version check; the window itself cannot reach
   release-asset hosts.
+  If `github.com/.../releases/download/...` fails (5xx, dropped connection),
+  the same asset is fetched from `api.github.com/repos/<owner>/<repo>/releases/`
+  `assets/<id>` with `Accept: application/octet-stream`. The fallback only
+  changes which endpoint serves the bytes: the manifest signature and the
+  installer SHA256 are still checked exactly as before, and the asset is
+  matched by file name against the requested release. Release metadata is
+  capped at 2 MiB and the API host is already on the allow-list.
   GitHub release assets are served without `Access-Control-Allow-Origin`, so a
   WebView `fetch()` of them is blocked by the browser before any signature
   could be verified — that is why manifest fetching lives in Rust.
