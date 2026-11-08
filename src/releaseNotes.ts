@@ -210,7 +210,7 @@ export function parseReleaseNotes(body: string | null | undefined, tag = ""): Pa
     for (const paragraph of paragraphs(block.lines)) {
       if (WORKFLOW_NOTICE.test(paragraph)) {
         // Render the workflow's unsigned/draft warning as an actionable note.
-        const cleaned = paragraph.replace(/\s*See docs\/[^\s.]+\.?/gi, "").trim();
+        const cleaned = paragraph.replace(/\s*See docs\/\S+/gi, "").trim();
         pushParagraph(sections, "notes", cleaned === "" ? paragraph : cleaned);
         continue;
       }

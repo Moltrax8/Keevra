@@ -254,7 +254,7 @@ jobs:
           $header = if ("${{ steps.signing.outputs.signed }}" -eq "true") {
             "Draft. Before publishing: attach the offline-signed updates.json and updates.json.minisig, then verify the Authenticode signature and provenance attestation.`n`n"
           } else {
-            "Unsigned build. Windows SmartScreen will warn that the publisher is unknown. Verify the installer against SHA256SUMS.txt and the build-provenance attestation before running it. See docs/RELEASE_SECURITY.md.`n`n"
+            "Unsigned build. Windows SmartScreen will warn that the publisher is unknown. Verify the installer against SHA256SUMS.txt and the build-provenance attestation before running it.`n`n"
           }
           Set-Content -Path release-notes.md -Value ($header + ($body -join "`n")) -Encoding utf8
 

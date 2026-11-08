@@ -52,6 +52,9 @@ describe("release note parsing", () => {
     expect(notesSection.label).toBe("Important Notes");
     expect(notesSection.items[0]?.body).toContain("SmartScreen");
     expect(notesSection.items[0]?.body).not.toContain("docs/RELEASE_SECURITY.md");
+    // The whole reference goes, not just the part before the first dot.
+    expect(notesSection.items[0]?.body).not.toContain(".md");
+    expect(notesSection.items[0]?.body).not.toMatch(/See docs\//i);
   });
 
   it("keeps bold item titles and their bodies", () => {
