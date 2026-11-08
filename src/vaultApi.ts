@@ -176,6 +176,21 @@ export async function updateVerifyManifest(manifestJson: string, manifestSig: st
   return invoke<VerifiedManifest>("update_verify_manifest", { manifestJson, manifestSig });
 }
 
+export interface SignedManifest {
+  manifestJson: string;
+  manifestSig: string;
+}
+
+/**
+ * Fetches `updates.json` + `.minisig` through Rust. GitHub release assets are
+ * served without CORS headers, so a WebView `fetch()` of them fails before the
+ * signature can be checked; the backend applies the same GitHub-only HTTPS
+ * allow-list and byte caps as the installer download.
+ */
+export async function updateFetchSignedManifest(manifestUrl: string, sigUrl: string): Promise<SignedManifest> {
+  return invoke<SignedManifest>("update_fetch_signed_manifest", { manifestUrl, sigUrl });
+}
+
 export interface ManifestDownload {
   bytes: number;
   version: string;

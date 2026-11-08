@@ -11,10 +11,15 @@ This document is the authority for the update channel alongside
   (`Moltrax8/Keevra`) with `Accept: application/vnd.github+json`.
   GitHub therefore sees the machine's IP and request time. The request carries
   **no** vault contents, account data, local paths, or telemetry.
-- The optional **download** performs HTTPS requests to `github.com` release
-  asset URLs for `updates.json`, its `.minisig`, and the installer. The
-  production CSP allows `api.github.com`, `github.com`, and GitHub
-  release-asset hosts for these requests, and nothing else.
+- The optional **download** happens in the Rust backend, not the WebView:
+  `updates.json`, its `.minisig` and the installer are fetched over HTTPS from
+  `github.com` release asset URLs through one GitHub-only allow-list that also
+  checks every redirect hop. The production CSP therefore allows only
+  `api.github.com` for the version check; the window itself cannot reach
+  release-asset hosts.
+  GitHub release assets are served without `Access-Control-Allow-Origin`, so a
+  WebView `fetch()` of them is blocked by the browser before any signature
+  could be verified — that is why manifest fetching lives in Rust.
 - The check runs 4s after launch and can be repeated from Settings; it fails
   silently when offline. There is no other network call in the app.
 
@@ -72,6 +77,10 @@ This document is the authority for the update channel alongside
 
 ## Verification (client)
 
+- Rust `updates::fetch_signed_manifest` (command
+  `update_fetch_signed_manifest`): downloads `updates.json` and its `.minisig`
+  with the same GitHub-only HTTPS allow-list, redirect policy and byte caps as
+  the installer, so the WebView never needs CORS access to release assets.
 - Rust `updates::parse_verified_manifest`: ed25519 verify over exact
   manifest bytes against any baked key → parse → validate shape (filesafe
   names, 64-hex SHAs) — in `update_verify_manifest`.

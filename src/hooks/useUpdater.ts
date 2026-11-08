@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { pickExportFile, updateDownloadManifestAsset, updateVerifyManifest } from "../vaultApi";
+import { pickExportFile, updateDownloadManifestAsset, updateFetchSignedManifest, updateVerifyManifest } from "../vaultApi";
 import { APP_NAME } from "../brand";
 import {
   compareVersionTags,
@@ -116,12 +116,15 @@ export function useUpdater(): UpdaterApi {
       let manifestJson = "";
       let manifestSig = "";
       try {
-        const [manifestResponse, sigResponse] = await Promise.all([fetch(pair.manifestUrl), fetch(pair.sigUrl)]);
-        if (!manifestResponse.ok || !sigResponse.ok) throw new Error("manifest_fetch");
-        manifestJson = await manifestResponse.text();
-        manifestSig = await sigResponse.text();
+        // Rust, not `fetch`: GitHub release assets carry no CORS headers, so a
+        // WebView request is blocked before the signature can be verified.
+        const fetched = await updateFetchSignedManifest(pair.manifestUrl, pair.sigUrl);
+        manifestJson = fetched.manifestJson;
+        manifestSig = fetched.manifestSig;
       } catch {
-        setStatus("Could not fetch the signed manifest. Not downloading.");
+        setStatus(
+          "Could not fetch the signed manifest. Not downloading. Try Settings → Check again, or install the latest release manually.",
+        );
         return;
       }
 

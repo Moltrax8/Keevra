@@ -156,6 +156,69 @@ fn validate_update_url(url: &str) -> Result<reqwest::Url, VaultError> {
     Ok(parsed)
 }
 
+/// Upper bound for the signed manifest, and for its detached signature. Both
+/// are tiny JSON/base64 documents, so anything bigger is not a manifest.
+const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_SIG_BYTES: u64 = 4 * 1024;
+
+/// Validates both manifest URLs before any request is made, so a hostile
+/// target is refused even before the size and redirect rules apply.
+fn manifest_fetch_targets(
+    manifest_url: &str,
+    sig_url: &str,
+) -> Result<(reqwest::Url, reqwest::Url), VaultError> {
+    Ok((validate_update_url(manifest_url)?, validate_update_url(sig_url)?))
+}
+
+/// Fetches a small text document over the update channel with a hard byte cap.
+async fn fetch_limited_text(
+    url: reqwest::Url,
+    cap: u64,
+    too_large: &str,
+) -> Result<String, VaultError> {
+    let client = update_http_client()?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?;
+    if !response.status().is_success() {
+        return Err(VaultError::Io("update_download_failed".to_string()));
+    }
+    if response.content_length().is_some_and(|length| length > cap) {
+        return Err(VaultError::Io(too_large.to_string()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| VaultError::Io(format!("update_download_failed:{e}")))?
+    {
+        if bytes.len() as u64 + chunk.len() as u64 > cap {
+            return Err(VaultError::Io(too_large.to_string()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| VaultError::Io("update_manifest_not_utf8".to_string()))
+}
+
+/// Fetches `updates.json` and `updates.json.minisig` in Rust.
+///
+/// GitHub serves release assets without `Access-Control-Allow-Origin`, so a
+/// WebView `fetch()` of the asset URL is blocked by CORS before the signature
+/// can ever be checked. Fetching here keeps the GitHub-only HTTPS allow-list,
+/// the redirect policy and the size caps identical to the installer download.
+pub async fn fetch_signed_manifest(
+    manifest_url: &str,
+    sig_url: &str,
+) -> Result<(String, String), VaultError> {
+    let (manifest_url, sig_url) = manifest_fetch_targets(manifest_url, sig_url)?;
+    let manifest =
+        fetch_limited_text(manifest_url, MAX_MANIFEST_BYTES, "update_manifest_too_large").await?;
+    let sig = fetch_limited_text(sig_url, MAX_SIG_BYTES, "update_signature_too_large").await?;
+    Ok((manifest, sig))
+}
+
 /// Downloads `url` (GitHub hosts, HTTPS only), verifies SHA256, saves to
 /// `dest_path` atomically. Returns byte count. Mismatch deletes nothing and
 /// writes nothing.
@@ -249,6 +312,21 @@ mod tests {
         assert!(validate_update_url("https://evil.example.com/x.exe").is_err());
         assert!(validate_update_url("https://github.com/Moltrax8/Keevra/releases/download/v1/x.exe").is_ok());
         assert!(validate_update_url("https://objects.githubusercontent.com/abc").is_ok());
+    }
+
+    #[test]
+    fn manifest_fetch_requires_github_https_urls() {
+        // Anything outside the allow-list, or plain HTTP, is refused before a
+        // request is made.
+        assert!(manifest_fetch_targets("http://github.com/updates.json", "https://github.com/s").is_err());
+        assert!(manifest_fetch_targets("https://evil.example.com/updates.json", "https://github.com/s").is_err());
+        assert!(manifest_fetch_targets("https://github.com/updates.json", "https://evil.example.com/s").is_err());
+        assert!(manifest_fetch_targets("https://github.com/updates.json", "http://github.com/s").is_err());
+        assert!(manifest_fetch_targets(
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/updates.json",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/updates.json.minisig"
+        )
+        .is_ok());
     }
 
     #[test]

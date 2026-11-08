@@ -803,6 +803,33 @@ fn update_verify_manifest(manifest_json: String, manifest_sig: String) -> Result
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SignedManifest {
+    manifest_json: String,
+    manifest_sig: String,
+}
+
+/// Fetches `updates.json` + `updates.json.minisig` through Rust.
+///
+/// The WebView cannot fetch GitHub release assets itself: they are served
+/// without `Access-Control-Allow-Origin`, so the browser blocks the response
+/// before any signature check can run. This keeps the GitHub-only HTTPS
+/// allow-list and the byte caps in one place (`updates::fetch_signed_manifest`).
+#[tauri::command]
+async fn update_fetch_signed_manifest(
+    manifest_url: String,
+    sig_url: String,
+) -> Result<SignedManifest, String> {
+    let (manifest_json, manifest_sig) = updates::fetch_signed_manifest(&manifest_url, &sig_url)
+        .await
+        .map_err(String::from)?;
+    Ok(SignedManifest {
+        manifest_json,
+        manifest_sig,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ManifestDownload {
     bytes: u64,
     version: String,
@@ -884,6 +911,7 @@ pub fn run() {
             vault_export_package,
             vault_import_package,
             update_verify_manifest,
+            update_fetch_signed_manifest,
             update_download_manifest_asset
         ])
         .run(tauri::generate_context!())

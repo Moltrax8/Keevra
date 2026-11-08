@@ -4,6 +4,41 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.4] - 2026-11-08
+
+**In-app update download works again: the signed manifest is fetched by the trusted backend.**
+
+Version 0.2.3 could notify you about a new release but then refused to download
+it, showing “Could not fetch the signed manifest”. The dialog fetched
+`updates.json` straight from GitHub in the WebView, and GitHub release assets
+carry no CORS headers, so the browser blocked the response before the signature
+could be checked. This release moves that fetch into the Rust backend, where
+the installer download already lived. Vaults, backups and packages are
+unaffected; there are no on-disk format changes.
+
+### Fixed
+
+- **“Could not fetch the signed manifest” no longer blocks updates.** The
+  manifest and its `.minisig` are downloaded by `update_fetch_signed_manifest`
+  with the same GitHub-only HTTPS allow-list, redirect policy and strict byte
+  caps (256 KiB manifest, 4 KiB signature) as the installer. The manifest is
+  still ed25519-verified against the baked keys before anything is downloaded,
+  and the installer SHA still comes only from the signed manifest.
+
+### Security
+
+- **The window can no longer reach release-asset hosts.** Since manifest
+  fetching moved to Rust, the production CSP allows only `api.github.com` for
+  the notify-only version check. Every download — manifest, signature and
+  installer — goes through the allow-listed Rust client that re-checks each
+  redirect hop.
+
+### Important Notes
+
+- **On 0.2.3, install 0.2.4 manually once.** The broken download code lives in
+  0.2.3 itself, so the fix cannot arrive through it: download this release's
+  installer and run it. Updates after 0.2.4 download and verify in the app.
+
 ## [0.2.3] - 2026-11-08
 
 **Security-hardening release: protected exports, conflict-aware saves and durable backups.**
