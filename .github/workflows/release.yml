@@ -210,13 +210,16 @@ jobs:
         run: npm sbom --sbom-format=cyclonedx > release-artifacts/keevra-npm-sbom.cdx.json
 
       - name: Rust SBOM (CycloneDX)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          path: src-tauri
-          format: cyclonedx-json
-          output-file: release-artifacts/keevra-rust-sbom.cdx.json
-          upload-artifact: false
-          upload-release-assets: false
+        shell: pwsh
+        run: |
+          # Generated from Cargo.lock through crates.io instead of downloading a
+          # scanner binary from GitHub releases: that download path can return
+          # 504 and block a tag build, while crates.io is independent of it.
+          cargo install cargo-cyclonedx --version 0.5.10 --locked
+          cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json
+          $sbom = Get-ChildItem src-tauri -Filter "*.cdx.json" | Select-Object -First 1
+          if (-not $sbom) { throw "cargo cyclonedx produced no SBOM" }
+          Move-Item -Path $sbom.FullName -Destination "release-artifacts/keevra-rust-sbom.cdx.json" -Force
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
