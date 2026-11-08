@@ -98,6 +98,67 @@ jobs:
           Set-Content -Path (Join-Path $env:RUNNER_TEMP "keevra-signing.json") -Value $config -Encoding utf8
           "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      # Tauri's bundler downloads the NSIS toolset from GitHub release assets
+      # through github.com's `/releases/download/...` redirect, which can return
+      # transient 504s while the same bytes are still served by the asset API.
+      # Seed the tool cache from the authoritative release via api.github.com so
+      # the bundle step never depends on that redirect path.
+      - name: Seed NSIS tool cache
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:LOCALAPPDATA "tauri"
+          $nsis = Join-Path $root "NSIS"
+          $dll = Join-Path $nsis "Plugins\x86-unicode\additional\nsis_tauri_utils.dll"
+          if ((Test-Path (Join-Path $nsis "makensis.exe")) -and (Test-Path $dll)) {
+            Write-Host "NSIS tool cache already present."
+            exit 0
+          }
+
+          New-Item -ItemType Directory -Force $root | Out-Null
+
+          function Save-ReleaseAsset {
+            param([string]$Repo, [string]$Tag, [string]$Name, [string]$OutFile)
+            $api = @{ Accept = "application/vnd.github+json"; Authorization = "Bearer $env:GITHUB_TOKEN" }
+            $release = Invoke-RestMethod -Headers $api -Uri "https://api.github.com/repos/$Repo/releases/tags/$Tag"
+            $asset = $release.assets | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+            if (-not $asset) { throw "asset $Name not found in $Repo@$Tag" }
+            $download = @{ Accept = "application/octet-stream"; Authorization = "Bearer $env:GITHUB_TOKEN" }
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              try {
+                Invoke-WebRequest -Headers $download -Uri $asset.url -OutFile $OutFile
+                return
+              } catch {
+                if ($attempt -eq 5) { throw }
+                Write-Host "attempt $attempt failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds (5 * $attempt)
+              }
+            }
+          }
+
+          $temp = Join-Path $env:RUNNER_TEMP "nsis-seed"
+          New-Item -ItemType Directory -Force $temp | Out-Null
+          $zip = Join-Path $temp "nsis-3.11.zip"
+          $dllDownload = Join-Path $temp "nsis_tauri_utils.dll"
+          Save-ReleaseAsset -Repo "tauri-apps/binary-releases" -Tag "nsis-3.11" -Name "nsis-3.11.zip" -OutFile $zip
+          Save-ReleaseAsset -Repo "tauri-apps/nsis-tauri-utils" -Tag "nsis_tauri_utils-v0.5.3" -Name "nsis_tauri_utils.dll" -OutFile $dllDownload
+
+          $expanded = Join-Path $temp "expanded"
+          Expand-Archive -Path $zip -DestinationPath $expanded -Force
+          # The archive has one top-level folder; pick the shallowest makensis.exe
+          # and copy that folder's contents, which is what Tauri expects.
+          $makensis = Get-ChildItem $expanded -Recurse -Filter "makensis.exe" |
+            Sort-Object { $_.FullName.Split([System.IO.Path]::DirectorySeparatorChar).Count } |
+            Select-Object -First 1
+          if (-not $makensis) { throw "makensis.exe not found in nsis-3.11.zip" }
+          New-Item -ItemType Directory -Force $nsis | Out-Null
+          Copy-Item -Path (Join-Path $makensis.Directory.FullName "*") -Destination $nsis -Recurse -Force
+          New-Item -ItemType Directory -Force (Split-Path $dll) | Out-Null
+          Copy-Item -Path $dllDownload -Destination $dll -Force
+          Write-Host "Seeded NSIS tool cache at $nsis"
+
       - name: Build NSIS installer
         shell: pwsh
         run: |
