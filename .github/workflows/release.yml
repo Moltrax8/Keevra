@@ -10,9 +10,14 @@ name: Release
 #
 # The update manifest is signed OFFLINE with the updater key and attached
 # manually (see docs/RELEASE_SECURITY.md).
+#
+# Manual dispatch only: Actions minutes are not available for this repository,
+# so tag pushes must not start a run that would immediately fail. Releases are
+# built and published with tools/release-local.ps1. If Actions is available
+# again, run the pipeline on a tag with:
+#   gh workflow run release.yml --ref v0.2.5
 on:
-  push:
-    tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

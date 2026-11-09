@@ -28,6 +28,8 @@ npm-debug.log*
 .env.*
 
 # Release artifacts belong in GitHub Releases, not in git
+release-artifacts/
+release-notes.md
 updates.json
 updates.json.minisig
 *.sha256

@@ -4,7 +4,7 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
-## [Unreleased]
+## [0.2.5] - 2026-11-09
 
 **Update downloads no longer depend on GitHub's release-download redirect.**
 

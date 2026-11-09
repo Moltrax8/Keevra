@@ -95,6 +95,24 @@ Attach both SBOMs to the release, or keep the CI artifact for at least as long
 as the release is supported. They are the inventory used when a new advisory
 needs to be matched against shipped versions.
 
+### Publishing without GitHub Actions
+
+GitHub Actions minutes are not always available. `tools/release-local.ps1`
+reproduces the release job on the maintainer's Windows machine: the same gates
+(`npm ci`, `npm audit`, `npm test`, `cargo test --locked`, `cargo check
+--locked`), the same NSIS build, the same artefacts (`installer`, `keevra.exe`,
+`SHA256SUMS.txt`, both CycloneDX SBOMs) and the same offline manifest signing
+through `tools/update-tool`.
+
+Those releases are labelled in their notes as built locally. They carry the
+checksums, SBOMs and the signed update manifest, but **no Sigstore build
+provenance attestation**, because that requires an OIDC identity from Actions.
+`gh attestation verify` therefore fails for them by design. When Actions is
+available again, prefer the workflow: it adds the attestations.
+
+Signing the manifest remains a separate, offline step in both paths; the
+private key never enters the repository, CI, or the release script's output.
+
 ## Release checklist
 
 1. CI (including the `supply-chain` job) is green on the release commit.

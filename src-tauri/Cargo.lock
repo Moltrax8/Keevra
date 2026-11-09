@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "keevra"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "argon2",
  "base64 0.22.1",

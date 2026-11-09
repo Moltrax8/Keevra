@@ -526,12 +526,14 @@ mod tests {
     #[test]
     #[ignore = "hits the live GitHub API"]
     fn live_manifest_fetch_and_installer_download() {
-        // Opt-in smoke test for the real network path:
+        // Opt-in smoke test for the real network path (tools/release-local.ps1
+        // runs it after publishing):
         //   cargo test --manifest-path src-tauri/Cargo.toml -- --ignored
         // It proves the asset-API fallback works while github.com's release
         // download redirect is misbehaving, then downloads the installer it
         // names and checks the signed SHA256.
-        let tag = "v0.2.4";
+        let tag = std::env::var("KEEVRA_LIVE_TAG").unwrap_or_else(|_| "v0.2.4".to_string());
+        let current = std::env::var("KEEVRA_LIVE_CURRENT").unwrap_or_else(|_| "0.2.0".to_string());
         let manifest_url =
             format!("https://github.com/Moltrax8/Keevra/releases/download/{tag}/updates.json");
         let sig_url = format!("{manifest_url}.minisig");
@@ -567,7 +569,7 @@ mod tests {
             &installer_url,
             &manifest,
             &sig,
-            "0.2.0",
+            &current,
             &dest,
         ))
         .expect("live installer download");
