@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "keevra"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1867,6 +1867,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

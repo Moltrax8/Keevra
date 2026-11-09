@@ -63,6 +63,12 @@ function Step($name) {
     Write-Host "=== $name ===" -ForegroundColor Cyan
 }
 
+# PowerShell 5.1's Get-Content decodes UTF-8 as ANSI, which turns the CHANGELOG's
+# curly quotes into mojibake that then gets published. Always read explicitly.
+function Read-Utf8([string]$RelativePath) {
+    [System.IO.File]::ReadAllText((Join-Path $repo $RelativePath), [System.Text.Encoding]::UTF8)
+}
+
 function Invoke-Native {
     param([scriptblock]$Command, [string]$What)
     & $Command
@@ -76,12 +82,12 @@ function Write-Utf8 {
 
 # ---------------------------------------------------------------- version gate
 Step "Version files"
-$pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
-$lock = [regex]::Match((Get-Content package-lock.json -Raw), '(?m)^\s{2}"version": "([^"]+)"').Groups[1].Value
-$cargo = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
-$conf = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+$pkg = (Read-Utf8 "package.json" | ConvertFrom-Json).version
+$lock = [regex]::Match((Read-Utf8 "package-lock.json"), '(?m)^\s{2}"version": "([^"]+)"').Groups[1].Value
+$cargo = [regex]::Match((Read-Utf8 "src-tauri/Cargo.toml"), '(?m)^version = "([^"]+)"').Groups[1].Value
+$conf = (Read-Utf8 "src-tauri/tauri.conf.json" | ConvertFrom-Json).version
 $cargoLock = [regex]::Match(
-    (Get-Content src-tauri/Cargo.lock -Raw),
+    (Read-Utf8 "src-tauri/Cargo.lock"),
     '(?m)^name = "keevra"\r?\nversion = "([^"]+)"').Groups[1].Value
 
 foreach ($pair in @(
@@ -94,7 +100,7 @@ foreach ($pair in @(
         throw "$($pair[0]) says $($pair[1]), expected $Version"
     }
 }
-if ((Get-Content CHANGELOG.md -Raw) -notmatch "(?m)^## \[$([regex]::Escape($Version))\]") {
+if ((Read-Utf8 "CHANGELOG.md") -notmatch "(?m)^## \[$([regex]::Escape($Version))\]") {
     throw "CHANGELOG.md has no '## [$Version]' section"
 }
 Write-Host "all version files and CHANGELOG say $Version"
@@ -168,14 +174,14 @@ Move-Item $sbom.FullName (Join-Path $artifacts "keevra-rust-sbom.cdx.json") -For
 
 # ------------------------------------------------------------------- notes
 Step "Release notes from CHANGELOG"
-$lines = Get-Content CHANGELOG.md
+$lines = (Read-Utf8 "CHANGELOG.md") -split "`r?`n"
 $trigger = $false
 $bodyLines = foreach ($line in $lines) {
     if (-not $trigger -and $line -match "^## \[$([regex]::Escape($Version))\]") { $trigger = $true }
     elseif ($trigger -and $line -match '^## \[') { break }
     elseif ($trigger) { $line }
 }
-$header = "Built locally and published unsigned: Windows SmartScreen will warn that the publisher is unknown. " +
+$header = "Unsigned build, published locally: Windows SmartScreen will warn that the publisher is unknown. " +
 "Verify the installer against SHA256SUMS.txt or let the in-app updater check the signed manifest before running it.`r`n`r`n"
 Write-Utf8 (Join-Path $repo "release-notes.md") ($header + ($bodyLines -join "`r`n"))
 

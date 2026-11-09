@@ -117,8 +117,11 @@ Out of scope (documented, not ignored):
   deliberately does not distinguish).
 - **Distribution:** manual installers, plus a notify-only update check that
   verifies a signed manifest before offering a download. It never installs
-  silently and never downloads without explicit user action. Packaging is
-  enabled for local test builds. Builds are unsigned by default.
+  silently and never downloads without explicit user action. After the
+  signature and SHA256 checks pass, the installer is opened in the Windows
+  setup wizard and Keevra exits so it can be replaced; the staged setup file is
+  deleted on the next start. Packaging is enabled for local test builds. Builds
+  are unsigned by default.
   Update downloads use a custom redirect policy: every hop, not just the first
   URL, must stay on the HTTPS GitHub allow-list, and chains are capped at 10
   hops. Release and CI workflows pin every third-party action to a full

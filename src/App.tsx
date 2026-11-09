@@ -120,7 +120,7 @@ function App() {
     generation: session.vaultGeneration,
   };
 
-  const updater = useUpdater();
+  const updater = useUpdater({ beforeRestart: () => session.handleVaultClose() });
 
   const vaultActive = session.backend === "unlocked";
 

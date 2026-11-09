@@ -86,8 +86,9 @@ export function UpdateDialog({
         </button>
 
         <p className="hint">
-          The installer is checked against the signed manifest and its SHA-256. {APP_NAME} never
-          installs silently; you run the saved file yourself.
+          The installer is checked against the signed manifest and its SHA-256, then opened in the
+          Windows setup wizard. {APP_NAME} closes so the installer can replace it, and the downloaded
+          setup file is removed afterwards.
         </p>
       </section>
     </div>

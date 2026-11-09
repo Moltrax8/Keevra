@@ -662,44 +662,60 @@ fn guarded_export_destination(
     Ok(dest_path)
 }
 
-/// Update installers must be `.exe` files outside the app data directory; the
-/// shared protected-target guard covers vaults and blobs. A non-installer
-/// extension is refused so a verified-download command cannot be used as a
-/// generic file drop.
-fn is_update_installer_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
-}
-
-/// Update installers may only be written as `.exe` files outside the app's own
-/// data directory; the shared protected-target guard covers vaults and blobs.
-fn guarded_update_destination(app: &AppHandle, dest: &str) -> Result<PathBuf, String> {
+/// Where a downloaded installer is staged before it is launched.
+///
+/// The path is fully derived here: a single `.exe` file name taken from the
+/// installer URL (validated by `updates::installer_file_name`) inside
+/// `<app data>/updates`. The frontend never supplies a path, so a verified
+/// download cannot be redirected onto a vault, backup, blob or registry file.
+fn update_staging_destination(app: &AppHandle, installer_url: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| VaultError::Io(e.to_string()))
         .map_err(String::from)?;
-    let registry_path = registry::registry_path(&dir);
-    let mut protected = vec![registry_path.clone(), registry::settings_path(&dir)];
-    if let Ok(entries) = registry::read_registry(&registry_path) {
-        protected.extend(entries.into_iter().map(|entry| PathBuf::from(entry.path)));
+    let name = updates::installer_file_name(installer_url).map_err(String::from)?;
+    let staging = updates::staging_dir(&dir);
+    std::fs::create_dir_all(&staging).map_err(|e| VaultError::Io(e.to_string()).to_string())?;
+    Ok(staging.join(name))
+}
+
+/// Opens the verified installer with the shell, so Windows shows the setup
+/// wizard and any required elevation prompt.
+#[cfg(windows)]
+fn launch_installer(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call; no other
+    // pointers are dereferenced.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute returns a value greater than 32 on success.
+    if (result as isize) <= 32 {
+        return Err(VaultError::Io("update_launch_failed".to_string()).to_string());
     }
-    // Also cover an open vault that is not listed (external path opened via
-    // the picker), even though the UI normally only opens registered vaults.
-    if let Some(state) = app.try_state::<VaultState>() {
-        if let Ok((_, _, _, path, _)) = session_path(&state) {
-            protected.push(path);
-        }
-    }
-    let dest_path = PathBuf::from(dest);
-    if !is_update_installer_path(&dest_path) {
-        return Err(VaultError::Io("invalid_update_destination".to_string()).to_string());
-    }
-    let protected_dirs = vec![dir.clone(), registry::vaults_dir(&dir)];
-    vault::ensure_export_destination(&dest_path, &protected, &protected_dirs)
-        .map_err(String::from)?;
-    Ok(dest_path)
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn launch_installer(_path: &Path) -> Result<(), String> {
+    Err(VaultError::Io("update_launch_failed".to_string()).to_string())
 }
 
 #[tauri::command]
@@ -830,26 +846,27 @@ async fn update_fetch_signed_manifest(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ManifestDownload {
+struct ManifestInstall {
     bytes: u64,
     version: String,
+    file_name: String,
 }
 
 /// Full gate: manifest signature + strictly-newer version + manifest-bound
-/// SHA download. Downgrades and unlisted assets are refused.
+/// SHA download, staged inside the app's update directory. The verified setup
+/// file is then opened in the Windows wizard. The frontend flushes and saves
+/// the vault, then calls `update_restart` so the installer can replace the
+/// running executable. Downgrades and unlisted assets are refused before
+/// anything is written or launched.
 #[tauri::command]
-async fn update_download_manifest_asset(
+async fn update_download_and_launch(
     app: AppHandle,
     installer_url: String,
     manifest_json: String,
     manifest_sig: String,
     current_version: String,
-    dest_path: String,
-) -> Result<ManifestDownload, String> {
-    // A verified installer must never be written over a vault, backup, blob,
-    // registry file or app data (KV-01). Only `.exe` targets outside the app
-    // directory are accepted.
-    let dest = guarded_update_destination(&app, &dest_path)?;
+) -> Result<ManifestInstall, String> {
+    let dest = update_staging_destination(&app, &installer_url)?;
     let (bytes, version) = updates::download_manifest_asset(
         &installer_url,
         &manifest_json,
@@ -859,7 +876,29 @@ async fn update_download_manifest_asset(
     )
     .await
     .map_err(String::from)?;
-    Ok(ManifestDownload { bytes, version })
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if let Err(error) = launch_installer(&dest) {
+        // Never leave an unlaunched setup file behind.
+        let _ = std::fs::remove_file(&dest);
+        return Err(error);
+    }
+
+    Ok(ManifestInstall {
+        bytes,
+        version,
+        file_name,
+    })
+}
+
+/// Closes Keevra so the setup wizard that is already open can replace it.
+#[tauri::command]
+fn update_restart(app: AppHandle) {
+    app.exit(0);
 }
 
 pub fn run() {
@@ -878,6 +917,10 @@ pub fn run() {
                     &registry::vaults_dir(&dir),
                     package::STALE_IMPORT_AGE,
                 );
+                // Remove the setup file a previous update left behind: the
+                // installer cannot delete its own running file, so the newly
+                // installed app does it on the first start.
+                updates::cleanup_staged_installers(&updates::staging_dir(&dir));
             }
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
@@ -912,7 +955,8 @@ pub fn run() {
             vault_import_package,
             update_verify_manifest,
             update_fetch_signed_manifest,
-            update_download_manifest_asset
+            update_download_and_launch,
+            update_restart
         ])
         .run(tauri::generate_context!())
         .expect(&format!("error while running {}", brand::APP_NAME));
@@ -1018,23 +1062,27 @@ mod tests {
         ));
     }
 
-    /// KV-01: only a `.exe` destination can receive a verified installer.
+    /// KV-01: the updater derives its own file name inside a dedicated
+    /// directory, so a verified download cannot be pointed at a vault, backup
+    /// or blob, and only an `.exe` installer can be staged and launched.
     #[test]
-    fn update_destination_requires_an_exe_name() {
-        assert!(is_update_installer_path(&PathBuf::from(
-            "C:\\Users\\me\\Downloads\\Keevra_0.2.3_x64-setup.exe"
-        )));
-        assert!(is_update_installer_path(&PathBuf::from("setup.EXE")));
+    fn update_staging_paths_stay_inside_the_update_directory() {
+        let staging =
+            PathBuf::from("C:\\Users\\me\\AppData\\Roaming\\com.keevra.desktop\\updates");
+        let name = updates::installer_file_name(
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/Keevra_1_x64-setup.exe",
+        )
+        .expect("installer name");
+        assert_eq!(staging.join(name), staging.join("Keevra_1_x64-setup.exe"));
         for rejected in [
-            "updates.json",
-            "Keevra_0.2.3_x64-setup.exe.txt",
-            "setup",
-            "setup.bat",
-            ".exe",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/updates.json",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/setup.bat",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/..%2Fvault.vault.exe",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/..%5C..%5Cvault.exe",
         ] {
             assert!(
-                !is_update_installer_path(&PathBuf::from(rejected)),
-                "accepted non-installer: {rejected}"
+                updates::installer_file_name(rejected).is_err(),
+                "accepted {rejected}"
             );
         }
     }

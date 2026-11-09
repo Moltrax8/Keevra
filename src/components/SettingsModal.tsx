@@ -143,8 +143,9 @@ export function SettingsModal({
         {packageMessage ? <p className="hint">{packageMessage}</p> : null}
         <h3 className="stack-heading">Updates</h3>
         <p className="hint">
-          Notify-only. {APP_NAME} checks GitHub releases, never downloads silently. Installer SHA256 is
-          verified before save; you run the installer yourself.
+          Notify-only check. {APP_NAME} never downloads silently. The installer SHA256 is verified,
+          then the Windows setup wizard opens; {APP_NAME} closes so the installer can replace it and
+          removes the downloaded file afterwards.
         </p>
         <div className="btn-row">
           <button type="button" className="btn-secondary" onClick={onCheckUpdates} disabled={updateBusy}>

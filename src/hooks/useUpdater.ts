@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { pickExportFile, updateDownloadManifestAsset, updateFetchSignedManifest, updateVerifyManifest } from "../vaultApi";
+import { updateDownloadAndLaunch, updateFetchSignedManifest, updateRestart, updateVerifyManifest } from "../vaultApi";
 import { APP_NAME } from "../brand";
 import {
   compareVersionTags,
@@ -15,6 +15,15 @@ import type { UpdateCheck } from "../components/UpdateDialog";
 /** Used only when `getVersion()` is unavailable (browser preview). */
 const FALLBACK_VERSION = "0.0.0";
 
+export interface UpdaterOptions {
+  /**
+   * Flush drafts and save the open vault before the app closes so the
+   * installer can replace it. Returning false keeps Keevra open so nothing is
+   * lost; the wizard stays open for the user to cancel or retry.
+   */
+  beforeRestart?: () => Promise<boolean>;
+}
+
 export interface UpdaterApi {
   updateCheck: UpdateCheck;
   updateDismissedTag: string | null;
@@ -25,7 +34,7 @@ export interface UpdaterApi {
   copyReleaseLink: () => Promise<void>;
 }
 
-export function useUpdater(): UpdaterApi {
+export function useUpdater(options: UpdaterOptions = {}): UpdaterApi {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck>({
     phase: "idle",
     current: FALLBACK_VERSION,
@@ -77,9 +86,10 @@ export function useUpdater(): UpdaterApi {
   }
 
   /**
-   * User-consented download gated on a signed manifest. Never auto-runs and
-   * never opens Settings: progress and verification results stay in the
-   * update dialog that asked for consent.
+   * User-consented download gated on a signed manifest. Never downloads
+   * silently; after verification the backend opens the installer in the
+   * Windows setup wizard and closes Keevra so it can be replaced. Progress and
+   * verification results stay in the update dialog that asked for consent.
    */
   async function handleUpdateDownload(): Promise<void> {
     const release = updateCheck.release;
@@ -139,30 +149,39 @@ export function useUpdater(): UpdaterApi {
         return;
       }
 
-      let dest: string | null = null;
-      try {
-        dest = await pickExportFile(installer.name);
-      } catch {
-        setStatus("File picker failed.");
-        return;
-      }
-      if (!dest) {
-        setStatus("Download cancelled — nothing was fetched.");
-        return;
-      }
-
       setStatus(`Downloading ${installer.name}… (manifest SHA check after download)`);
       try {
-        const result = await updateDownloadManifestAsset(
+        const result = await updateDownloadAndLaunch(
           installer.browser_download_url,
           manifestJson,
           manifestSig,
           current,
-          dest,
         );
         setStatus(
-          `Verified signed manifest for ${result.version} and SHA-256 (${(result.bytes / 1048576).toFixed(1)} MB). Saved — run the file yourself to update; ${APP_NAME} never installs silently.`,
+          `Verified signed manifest for ${result.version} and SHA-256 (${(result.bytes / 1048576).toFixed(1)} MB). Opening the setup wizard — ${APP_NAME} closes so the installer can replace it. The downloaded file is removed afterwards.`,
         );
+        // The wizard is already open. Put any in-flight edit on disk before
+        // the process exits; if the save fails, keep the app open so nothing
+        // is lost and let the user cancel the wizard.
+        let readyToClose = true;
+        if (options.beforeRestart) {
+          try {
+            readyToClose = await options.beforeRestart();
+          } catch {
+            readyToClose = false;
+          }
+        }
+        if (!readyToClose) {
+          setStatus(
+            "Update verified and the setup wizard is open, but your latest changes could not be saved. Close the wizard, resolve the save error, then run the update again.",
+          );
+          return;
+        }
+        try {
+          await updateRestart();
+        } catch {
+          // The IPC connection dies as the process exits; nothing to do.
+        }
       } catch (error) {
         const message = typeof error === "string" ? error : "";
         if (message.includes("not_newer")) {
@@ -173,10 +192,8 @@ export function useUpdater(): UpdaterApi {
           message.includes("not_in_manifest")
         ) {
           setStatus("VERIFICATION FAILED — file was NOT saved or installed. Treat the release as untrusted.");
-        } else if (message.includes("invalid_update_destination")) {
-          setStatus("Save the installer with an .exe file name outside the Keevra data folder.");
-        } else if (message.includes("protected_destination")) {
-          setStatus("That location belongs to Keevra. Choose a different file name or folder.");
+        } else if (message.includes("update_launch_failed")) {
+          setStatus("The installer verified but Windows could not open it. Use “Copy release link” and install it manually.");
         } else {
           setStatus("Download failed. Nothing was installed.");
         }

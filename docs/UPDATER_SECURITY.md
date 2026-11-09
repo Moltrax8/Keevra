@@ -38,8 +38,13 @@ This document is the authority for the update channel alongside
    `updates.json.minisig` release assets), not the `.sha256` sidecar.
    SHA-from-GitHub alone proves transit integrity, not publisher — a
    compromised GitHub account could forge both binary and sidecar.
-3. The installer is **never launched** by the app. Verified bytes are saved
-   via the user's own save dialog; the user runs the installer manually.
+3. A verified installer is **opened in the Windows setup wizard**: the app
+   stages it inside its own `<app data>/updates` directory under a single
+   `.exe` name derived from the release URL, launches it through the shell
+   (UAC prompt included) and then flushes drafts, saves and locks the vault
+   before `update_restart` closes the process so NSIS can replace it. The user
+   still clicks through the wizard; nothing is installed without that
+   interaction, and the staged setup file is removed on the next start.
 4. Unsigned releases get **no download button** — release page only.
 
 ## Keys
@@ -79,8 +84,10 @@ This document is the authority for the update channel alongside
    `cargo run --manifest-path tools/update-tool/Cargo.toml -- sign updates.json --key <offline.key>` → `updates.json.minisig`.
 4. Attach to the GitHub release: installer EXE, `updates.json`,
    `updates.json.minisig` (keep any legacy `.sha256` as informational only).
-5. Smoke test: fresh machine, Settings → Check → Download → mismatch drill
-   (tampered manifest must refuse with signature error).
+5. Smoke test: fresh machine, Settings → Check → Download → the setup wizard
+   opens and Keevra closes → finish the wizard → the next start removes the
+   staged installer. Mismatch drill: a tampered manifest must refuse with a
+   signature error.
 
 ## Verification (client)
 
@@ -96,6 +103,15 @@ This document is the authority for the update channel alongside
   binds installer basename to a manifest asset
   (`update_asset_not_in_manifest` otherwise), downloads over HTTPS from
   GitHub hosts only, compares SHA, atomic save only on match.
+- `update_download_and_launch`: derives the staging path itself
+  (`<app data>/updates/<single .exe name>`; ASCII letters, digits, `.`, `_`,
+  `-` only), so the frontend cannot redirect a verified download onto a vault,
+  backup, blob or registry file. After the gate passes it opens the file with
+  `ShellExecuteW`. The frontend then flushes drafts and saves/locks the vault
+  (a failed save keeps Keevra open) and calls `update_restart`; a failed
+  launch deletes the staged file and reports `update_launch_failed`. Successful
+  installs are removed by `cleanup_staged_installers` on the next start (the
+  installer cannot delete its own running file).
 - Frontend additionally: major-version bump requires a second `confirm()`;
   auto-check is delayed 4s post-launch, fails silent offline, and only ever
   renders a dismissible banner.

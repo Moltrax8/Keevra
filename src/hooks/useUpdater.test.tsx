@@ -2,17 +2,17 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  pickExportFile,
-  updateDownloadManifestAsset,
+  updateDownloadAndLaunch,
   updateFetchSignedManifest,
+  updateRestart,
   updateVerifyManifest,
 } from "../vaultApi";
 import { useUpdater } from "./useUpdater";
 
 vi.mock("../vaultApi", () => ({
-  pickExportFile: vi.fn(),
-  updateDownloadManifestAsset: vi.fn(),
+  updateDownloadAndLaunch: vi.fn(),
   updateFetchSignedManifest: vi.fn(),
+  updateRestart: vi.fn(),
   updateVerifyManifest: vi.fn(),
 }));
 
@@ -73,8 +73,11 @@ describe("update download", () => {
       manifestSig: "c2ln",
     });
     vi.mocked(updateVerifyManifest).mockResolvedValue({ version: "9.9.9", assetNames: [] });
-    vi.mocked(pickExportFile).mockResolvedValue("C:\\Users\\me\\Keevra_9.9.9_x64-setup.exe");
-    vi.mocked(updateDownloadManifestAsset).mockResolvedValue({ bytes: 2048, version: "9.9.9" });
+    vi.mocked(updateDownloadAndLaunch).mockResolvedValue({
+      bytes: 2048,
+      version: "9.9.9",
+      fileName: "Keevra_9.9.9_x64-setup.exe",
+    });
 
     const hook = await availableUpdater();
     fetchMock.mockClear();
@@ -85,14 +88,65 @@ describe("update download", () => {
 
     expect(updateFetchSignedManifest).toHaveBeenCalledWith(MANIFEST_URL, SIG_URL);
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(updateDownloadManifestAsset).toHaveBeenCalledWith(
+    expect(updateDownloadAndLaunch).toHaveBeenCalledWith(
       "https://github.com/Moltrax8/Keevra/releases/download/v9.9.9/Keevra_9.9.9_x64-setup.exe",
       '{"version":"9.9.9","assets":[]}',
       "c2ln",
       expect.any(String),
-      "C:\\Users\\me\\Keevra_9.9.9_x64-setup.exe",
     );
-    expect(hook.result.current.updateCheck.message).toContain("Verified signed manifest");
+    expect(hook.result.current.updateCheck.message).toContain("Opening the setup wizard");
+    expect(updateRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushes the vault before closing for the setup wizard", async () => {
+    vi.mocked(updateFetchSignedManifest).mockResolvedValue({
+      manifestJson: '{"version":"9.9.9","assets":[]}',
+      manifestSig: "c2ln",
+    });
+    vi.mocked(updateVerifyManifest).mockResolvedValue({ version: "9.9.9", assetNames: [] });
+    vi.mocked(updateDownloadAndLaunch).mockResolvedValue({
+      bytes: 2048,
+      version: "9.9.9",
+      fileName: "Keevra_9.9.9_x64-setup.exe",
+    });
+    const beforeRestart = vi.fn().mockResolvedValue(true);
+
+    const hook = renderHook(() => useUpdater({ beforeRestart }));
+    await act(async () => {
+      await hook.result.current.checkForUpdates(true);
+    });
+    await act(async () => {
+      await hook.result.current.handleUpdateDownload();
+    });
+
+    expect(beforeRestart).toHaveBeenCalledTimes(1);
+    expect(updateRestart).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the app open when the pre-restart save fails", async () => {
+    vi.mocked(updateFetchSignedManifest).mockResolvedValue({
+      manifestJson: '{"version":"9.9.9","assets":[]}',
+      manifestSig: "c2ln",
+    });
+    vi.mocked(updateVerifyManifest).mockResolvedValue({ version: "9.9.9", assetNames: [] });
+    vi.mocked(updateDownloadAndLaunch).mockResolvedValue({
+      bytes: 2048,
+      version: "9.9.9",
+      fileName: "Keevra_9.9.9_x64-setup.exe",
+    });
+    const beforeRestart = vi.fn().mockResolvedValue(false);
+
+    const hook = renderHook(() => useUpdater({ beforeRestart }));
+    await act(async () => {
+      await hook.result.current.checkForUpdates(true);
+    });
+    await act(async () => {
+      await hook.result.current.handleUpdateDownload();
+    });
+
+    expect(beforeRestart).toHaveBeenCalledTimes(1);
+    expect(updateRestart).not.toHaveBeenCalled();
+    expect(hook.result.current.updateCheck.message).toContain("could not be saved");
   });
 
   it("reports a backend fetch failure without touching the installer", async () => {
@@ -103,8 +157,7 @@ describe("update download", () => {
       await hook.result.current.handleUpdateDownload();
     });
 
-    expect(updateDownloadManifestAsset).not.toHaveBeenCalled();
-    expect(pickExportFile).not.toHaveBeenCalled();
+    expect(updateDownloadAndLaunch).not.toHaveBeenCalled();
     expect(hook.result.current.updateCheck.message).toContain("Could not fetch the signed manifest");
   });
 
@@ -117,7 +170,24 @@ describe("update download", () => {
       await hook.result.current.handleUpdateDownload();
     });
 
-    expect(updateDownloadManifestAsset).not.toHaveBeenCalled();
+    expect(updateDownloadAndLaunch).not.toHaveBeenCalled();
     expect(hook.result.current.updateCheck.message).toContain("SIGNATURE INVALID");
+  });
+
+  it("reports a stalled setup wizard instead of claiming success", async () => {
+    vi.mocked(updateFetchSignedManifest).mockResolvedValue({
+      manifestJson: '{"version":"9.9.9","assets":[]}',
+      manifestSig: "c2ln",
+    });
+    vi.mocked(updateVerifyManifest).mockResolvedValue({ version: "9.9.9", assetNames: [] });
+    vi.mocked(updateDownloadAndLaunch).mockRejectedValue("update_launch_failed");
+
+    const hook = await availableUpdater();
+    await act(async () => {
+      await hook.result.current.handleUpdateDownload();
+    });
+
+    expect(hook.result.current.updateCheck.message).toContain("could not open it");
+    expect(hook.result.current.updateCheck.message).toContain("install it manually");
   });
 });

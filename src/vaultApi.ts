@@ -191,26 +191,36 @@ export async function updateFetchSignedManifest(manifestUrl: string, sigUrl: str
   return invoke<SignedManifest>("update_fetch_signed_manifest", { manifestUrl, sigUrl });
 }
 
-export interface ManifestDownload {
+export interface ManifestInstall {
   bytes: number;
   version: string;
+  /** Basename of the staged setup file; deleted on the next app start. */
+  fileName: string;
 }
 
-/** Manifest-gated download: signature + newer-version + manifest SHA enforced in Rust. */
-export async function updateDownloadManifestAsset(
+/**
+ * Manifest-gated download: signature + newer-version + manifest SHA enforced in
+ * Rust. The verified installer is staged inside Keevra's update directory and
+ * opened in the Windows setup wizard; the app then closes so the installer can
+ * replace it.
+ */
+export async function updateDownloadAndLaunch(
   installerUrl: string,
   manifestJson: string,
   manifestSig: string,
   currentVersion: string,
-  destPath: string,
-): Promise<ManifestDownload> {
-  return invoke<ManifestDownload>("update_download_manifest_asset", {
+): Promise<ManifestInstall> {
+  return invoke<ManifestInstall>("update_download_and_launch", {
     installerUrl,
     manifestJson,
     manifestSig,
     currentVersion,
-    destPath,
   });
+}
+
+/** Closes Keevra so the setup wizard that is already open can replace it. */
+export async function updateRestart(): Promise<void> {
+  return invoke<void>("update_restart");
 }
 
 /** Native file picker for imports. Returns null when cancelled. */

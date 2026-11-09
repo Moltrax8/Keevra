@@ -4,6 +4,43 @@ All notable changes to Keevra are recorded here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Keevra is pre-1.0 and does not use Semantic Versioning yet.
 
+## [0.2.6] - 2026-11-09
+
+**The updater now opens the Windows setup wizard for you.**
+
+After the signed manifest and the installer SHA-256 check pass, Keevra starts
+the setup wizard and closes itself so the installer can replace the running
+app. You still confirm the installation in the wizard — nothing is installed
+without that click — but there is no longer a save dialog or a “find the file
+and run it yourself” step. The downloaded setup file is deleted on the next
+start, so installers no longer pile up in Downloads.
+
+### Changed
+
+- **Download update → setup wizard.** The verified installer is staged inside
+  Keevra's own `<app data>/updates` directory under a single `.exe` name
+  derived from the signed release URL, opened through the Windows shell (so a
+  setup that needs elevation still gets its UAC prompt), and cleaned up on the
+  next launch.
+- **No save dialog for updates.** The app owns the staging directory, so the
+  frontend never supplies a path and a verified download can no longer be
+  redirected onto a vault, backup, blob or registry file.
+
+### Fixed
+
+- **A failed launch is reported instead of claiming success.** If Windows
+  cannot open the verified installer, the staged file is removed and the
+  dialog offers the release link for a manual install.
+
+### Important Notes
+
+- **0.2.4 and newer can update in place.** The broken manifest fetch lives in
+  0.2.3 only; older builds must install one release manually before the
+  in-app updater works again.
+- **The installer is still unsigned.** Windows SmartScreen warns that the
+  publisher is unknown on first install; the signed update manifest and
+  SHA256SUMS.txt let you verify the download.
+
 ## [0.2.5] - 2026-11-09
 
 **Update downloads no longer depend on GitHub's release-download redirect.**

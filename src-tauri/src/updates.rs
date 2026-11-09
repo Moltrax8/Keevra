@@ -6,13 +6,15 @@
 //! `.minisig` published per release, private key offline): the installer
 //! SHA comes from the verified manifest — never from an unsigned `.sha256`
 //! file an attacker could forge alongside a malicious binary. Version must
-//! be strictly newer (downgrades refused). Nothing is ever launched — the
-//! user runs the installer manually.
+//! be strictly newer (downgrades refused). A verified installer is opened in
+//! the Windows setup wizard and the app exits so NSIS can replace it; the
+//! staged setup file is deleted on the next start.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::update_keys::UPDATE_SIGNING_KEYS;
 use crate::vault::{write_atomic_bytes, VaultError};
@@ -300,6 +302,98 @@ async fn api_asset_url(
     }
 }
 
+/// The only file name the updater will write and launch: the final path segment
+/// of the installer URL, restricted to ASCII alphanumerics plus `.`, `_`, `-`
+/// with an `.exe` suffix.
+///
+/// The manifest binds downloads by asset name, so rejecting anything that is
+/// not a plain single file name keeps a hostile release from steering the write
+/// to another path. Percent signs are refused outright, which removes the
+/// encoded-separator ambiguity that URL path segments can still carry.
+fn installer_name_from_url(parsed: &reqwest::Url) -> Result<String, VaultError> {
+    let name = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or("")
+        .to_string();
+    let safe_chars = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if name.is_empty()
+        || name.len() == ".exe".len()
+        || !safe_chars
+        || !name.to_ascii_lowercase().ends_with(".exe")
+    {
+        return Err(VaultError::Io("invalid_update_url".to_string()));
+    }
+    Ok(name)
+}
+
+/// Public wrapper so the command layer derives the staging file name from the
+/// same validated URL the download will use.
+pub fn installer_file_name(installer_url: &str) -> Result<String, VaultError> {
+    let parsed = validate_update_url(installer_url)?;
+    installer_name_from_url(&parsed)
+}
+
+/// Directory inside the app data folder that holds an in-flight installer.
+/// It is never the vault directory, so cleanup cannot touch ciphertext.
+pub const UPDATE_STAGING_DIR: &str = "updates";
+
+pub fn staging_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(UPDATE_STAGING_DIR)
+}
+
+/// Removes setup files left behind by an earlier update attempt.
+///
+/// The installer cannot delete its own running file, so the setup file is
+/// removed by the newly installed app on start (or by the next start after a
+/// cancelled wizard). Only `.exe` installers and `.tmp` atomic-write leftovers
+/// are touched; files with any other name are left alone. NSIS may still hold
+/// the file open for a moment when the new app starts, so deletion is retried
+/// in the background for a few seconds.
+pub fn cleanup_staged_installers(dir: &Path) {
+    remove_when_unlocked(staged_installers(dir));
+}
+
+/// The `.exe`/`.tmp` files present in `dir` right now.
+pub fn staged_installers(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            (lower.ends_with(".exe") || lower.ends_with(".tmp")).then_some(path)
+        })
+        .collect()
+}
+
+/// Deletes exactly these files, retrying once a second for ~15s.
+///
+/// Only the paths captured at startup are touched, so a setup file downloaded
+/// after startup can never be removed by this background pass.
+fn remove_when_unlocked(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut pending = paths;
+        for _ in 0..15 {
+            pending.retain(|path| path.exists() && std::fs::remove_file(path).is_err());
+            if pending.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
 /// Downloads over the update channel, falling back to the GitHub asset API.
 ///
 /// `github.com/{owner}/{repo}/releases/download/...` can answer 5xx or drop the
@@ -391,14 +485,7 @@ pub async fn download_manifest_asset(
         return Err(VaultError::Io("update_not_newer".to_string()));
     }
     let parsed = validate_update_url(installer_url)?;
-    let file_name = parsed
-        .path_segments()
-        .and_then(|mut segments| segments.next_back())
-        .unwrap_or("")
-        .to_string();
-    if file_name.is_empty() {
-        return Err(VaultError::Io("invalid_update_url".to_string()));
-    }
+    let file_name = installer_name_from_url(&parsed)?;
     let asset = manifest
         .assets
         .iter()
@@ -513,6 +600,63 @@ mod tests {
             release_download_parts(&encoded).expect("plain release download url").3,
             "Keevra_1_x64-setup.exe"
         );
+    }
+
+    #[test]
+    fn installer_names_are_single_ascii_exe_files() {
+        assert_eq!(
+            installer_file_name(
+                "https://github.com/Moltrax8/Keevra/releases/download/v1/Keevra_1_x64-setup.exe"
+            )
+            .expect("plain installer name"),
+            "Keevra_1_x64-setup.exe"
+        );
+        for rejected in [
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/setup.msi",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/updates.json",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/.exe",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/..%2Fevil.exe",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/..%5Cevil.exe",
+            "https://github.com/Moltrax8/Keevra/releases/download/v1/spa%20ce.exe",
+            "https://evil.example.com/Keevra.exe",
+        ] {
+            assert!(installer_file_name(rejected).is_err(), "accepted {rejected}");
+        }
+    }
+
+    #[test]
+    fn staged_cleanup_only_targets_installers_and_temp_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "keevra-update-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("staging dir");
+        for name in ["Keevra_1_x64-setup.exe", "setup.EXE", "x.exe.123.tmp"] {
+            std::fs::write(dir.join(name), b"x").expect("staged file");
+        }
+        for name in ["notes.txt", "updates.json"] {
+            std::fs::write(dir.join(name), b"keep").expect("unrelated file");
+        }
+        let mut staged: Vec<String> = staged_installers(&dir)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        staged.sort();
+        assert_eq!(
+            staged,
+            ["Keevra_1_x64-setup.exe", "setup.EXE", "x.exe.123.tmp"]
+        );
+        for path in staged_installers(&dir) {
+            std::fs::remove_file(path).expect("remove staged file");
+        }
+        assert!(dir.join("notes.txt").exists());
+        assert!(dir.join("updates.json").exists());
+        // A missing directory is not an error: the app can start before the
+        // first update ever downloads.
+        assert!(staged_installers(&dir.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
