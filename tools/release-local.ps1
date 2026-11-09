@@ -204,8 +204,11 @@ if (-not (git tag --list $tag)) {
 Invoke-Native { git push origin $tag } "git push tag"
 
 $releaseExists = $false
-gh release view $tag --json tagName 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+$previousEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+gh release view $tag --json tagName 2>$null | Out-Null
+$releaseExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $previousEap
 
 $assetPaths = @(Get-ChildItem $artifacts | ForEach-Object { $_.FullName })
 if ($releaseExists) {
