@@ -102,7 +102,8 @@ Out of scope (documented, not ignored):
   `vault_open`, `vault_save`, `vault_lock`, `vault_restore_backup`,
   `attachment_import`, `attachment_export`, `attachment_read`,
   `vault_export_package`, `vault_import_package`, `update_verify_manifest`,
-  `update_download_manifest_asset`. Filesystem access stays in Rust;
+  `update_fetch_signed_manifest`, `update_download_and_launch`,
+  `update_restart`. Filesystem access stays in Rust;
   the only plugins are dialog path-pickers (`dialog:allow-open/save`).
   Document validation stays in TypeScript (`vaultDocument.ts`); Rust treats
   the document as an opaque JSON map and only re-validates non-empty unique
