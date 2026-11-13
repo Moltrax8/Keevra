@@ -68,7 +68,7 @@ jobs:
       # Audit the exact locked graph of the tagged commit. CI runs this on
       # main, but a tag can point at an unmerged commit, so the gate is
       # repeated here rather than inherited.
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-audit
 
